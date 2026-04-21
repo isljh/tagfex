@@ -1,13 +1,13 @@
 {
     "prefix": "reproduce",
-    "dataset": "imagenet100_lejepa",
+    "dataset": "imagenet100_aa",
     "memory_size": 2000,
     "memory_per_class": 20,
     "fixed_memory": false,
     "shuffle": true,
     "init_cls": 10,
     "increment": 10,
-    "model_name": "tagfex",
+    "model_name": "tagfex_ta_detach",
     "convnet_type": "resnet18",
     "device": ["0"],
     "seed": [1993],
@@ -24,8 +24,8 @@
     "transfer_factor":1,
     "aux_factor":2,
     "contrast_kd_factor":2,
-    "aug":1,
+    "aug":2,
     "num_views": 8,
     "lejepa_lambda": 0.05,
-    "is_distributed": true
+    "is_distributed": false
 }

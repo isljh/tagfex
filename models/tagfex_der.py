@@ -13,14 +13,19 @@ import swanlab
 EPSILON = 1e-8
 
 init_epoch = 200
-init_lr = 5e-4
-init_weight_decay = 5e-4
+init_lr = 0.1
+init_milestones = [60, 120, 170]
+init_lr_decay = 0.1
+init_weight_decay = 0.0005
+momentum = 0.9
 
 epochs = 170
-update_lr = 5e-4
+lrate = 0.1
+milestones = [80, 120, 150]
+lrate_decay = 0.1
 batch_size = 128
-weight_decay = 5e-4
-num_workers = 16
+weight_decay = 2e-4
+num_workers = 8
 
 
 class TagFex(BaseLearner):
@@ -33,8 +38,12 @@ class TagFex(BaseLearner):
         local_rank = self.args.get("local_rank", 0)
         if local_rank <= 0:
             swanlab.init(
-                project="PyCIL_TagFex",
-                experiment_name=f"TagFex_DER",
+                project="PyCIL_TagFex_Ablation",
+                experiment_name="{}_{}_{}".format(
+                    self.args.get("prefix", "run"),
+                    self.args.get("dataset", "dataset"),
+                    self.args.get("model_name", "tagfex_der"),
+                ),
                 config=self.args,
                 suffix="timestamp"
             )
@@ -137,26 +146,28 @@ class TagFex(BaseLearner):
         self._network.to(self._device)
         torch.backends.cudnn.benchmark = True
 
-        trainable_params = filter(lambda p: p.requires_grad, self._network.parameters())
-
         if self._cur_task == 0:
-            optimizer = torch.optim.AdamW(trainable_params, lr=init_lr, weight_decay=init_weight_decay)
-            warmup_steps = len(train_loader)
-            total_steps = len(train_loader) * init_epoch
-            s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-            s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps,
-                                                             eta_min=init_lr / 1000)
-            scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
+            optimizer = torch.optim.SGD(
+                filter(lambda p: p.requires_grad, self._network.parameters()),
+                momentum=momentum,
+                lr=init_lr,
+                weight_decay=init_weight_decay,
+            )
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer=optimizer, milestones=init_milestones, gamma=init_lr_decay
+            )
             self._init_train(train_loader, test_loader, optimizer, scheduler)
         else:
             torch.cuda.empty_cache()
-            trainable_params = filter(lambda p: p.requires_grad, self._network.parameters())
-            optimizer = torch.optim.AdamW(trainable_params, lr=update_lr, weight_decay=weight_decay)
-            warmup_steps = len(train_loader)
-            total_steps = len(train_loader) * epochs
-            s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-            s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6)
-            scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
+            optimizer = torch.optim.SGD(
+                filter(lambda p: p.requires_grad, self._network.parameters()),
+                lr=lrate,
+                momentum=momentum,
+                weight_decay=weight_decay,
+            )
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer=optimizer, milestones=milestones, gamma=lrate_decay
+            )
             self._update_representation(train_loader, test_loader, optimizer, scheduler)
 
             ptr = self._network.module if hasattr(self._network, 'module') else self._network
@@ -166,9 +177,8 @@ class TagFex(BaseLearner):
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         local_rank = self.args.get("local_rank", 0)
         disable_tqdm = (local_rank > 0)
-        prog_bar = tqdm(range(init_epoch), disable=disable_tqdm)
+        prog_bar = tqdm(range(init_epoch), disable=disable_tqdm, dynamic_ncols=True)
 
-        V_dim = self.args.get('num_views', 8)
         batch_step = 0
 
         for _, epoch in enumerate(prog_bar):
@@ -178,32 +188,31 @@ class TagFex(BaseLearner):
 
             self.train()
             losses, correct, total = 0.0, 0, 0
-            for i, data in enumerate(train_loader):
-                vs = data[1].to(self._device)   # [N, V, C, H, W]
-                targets = data[-1].to(self._device)
+            for _, (_, inputs1, inputs2, targets) in enumerate(train_loader):
+                inputs1 = inputs1.to(self._device)
+                inputs2 = inputs2.to(self._device)
+                targets = targets.to(self._device)
 
-                inputs = vs.flatten(0, 1)        # [N*V, C, H, W]
+                inputs = torch.cat([inputs1, inputs2], dim=0)
                 out = self._network(inputs)
                 logits = out["logits"]
 
-                y_rep = targets.repeat_interleave(V_dim)
-                loss = F.cross_entropy(logits, y_rep)
+                targets = torch.cat([targets, targets], dim=0)
+                loss = F.cross_entropy(logits, targets)
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
 
                 _, preds = torch.max(logits, dim=1)
-                batch_correct = preds.eq(y_rep).sum().item()
-                batch_total = y_rep.size(0)
+                batch_correct = preds.eq(targets).sum().item()
+                batch_total = targets.size(0)
                 batch_acc = batch_correct * 100 / batch_total
 
                 if local_rank <= 0:
                     swanlab.log({
                         "init/total_loss": loss.item(),
                         "init/batch_acc": batch_acc,
-                        "init/lr": optimizer.param_groups[0]['lr'],
                     }, step=batch_step)
                     batch_step += 1
 
@@ -211,6 +220,7 @@ class TagFex(BaseLearner):
                 total += batch_total
                 losses += loss.item()
 
+            scheduler.step()
             if not disable_tqdm:
                 train_acc = np.around(correct * 100 / total, decimals=2)
                 prog_bar.set_description(
@@ -219,31 +229,32 @@ class TagFex(BaseLearner):
     def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
         local_rank = self.args.get("local_rank", 0)
         disable_tqdm = (local_rank > 0)
-        prog_bar = tqdm(range(epochs), disable=disable_tqdm)
+        prog_bar = tqdm(range(epochs), disable=disable_tqdm, dynamic_ncols=True)
 
-        V_dim = self.args.get('num_views', 8)
         task_prefix = f"Task_{self._cur_task}"
         batch_step = 0
 
         for _, epoch in enumerate(prog_bar):
             if train_loader.sampler is not None:
-                train_loader.sampler.set_epoch(epoch)
+                if isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                    train_loader.sampler.set_epoch(epoch)
 
             self.train()
             losses, losses_clf, losses_aux, correct, total = 0.0, 0.0, 0.0, 0, 0
-            for i, data in enumerate(train_loader):
-                vs = data[1].to(self._device)   # [N, V, C, H, W]
-                targets = data[-1].to(self._device)
+            for _, (_, inputs1, inputs2, targets) in enumerate(train_loader):
+                inputs1 = inputs1.to(self._device)
+                inputs2 = inputs2.to(self._device)
+                targets = targets.to(self._device)
 
-                inputs = vs.flatten(0, 1)        # [N*V, C, H, W]
+                inputs = torch.cat([inputs1, inputs2], dim=0)
                 outputs = self._network(inputs)
                 logits = outputs["logits"]
                 aux_logits = outputs["aux_logits"]
 
-                y_rep = targets.repeat_interleave(V_dim)
-                loss_clf = F.cross_entropy(logits, y_rep)
+                targets = torch.cat([targets, targets], dim=0)
+                loss_clf = F.cross_entropy(logits, targets)
 
-                aux_targets = y_rep.clone()
+                aux_targets = targets.clone()
                 aux_targets = torch.where(
                     aux_targets - self._known_classes + 1 > 0,
                     aux_targets - self._known_classes + 1,
@@ -256,15 +267,14 @@ class TagFex(BaseLearner):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
 
                 losses += loss.item()
                 losses_clf += loss_clf.item()
                 losses_aux += loss_aux.item()
                 _, preds = torch.max(logits, dim=1)
-                batch_acc = preds.eq(y_rep).sum().item() * 100.0 / y_rep.size(0)
-                correct += preds.eq(y_rep).cpu().sum()
-                total += y_rep.size(0)
+                batch_acc = preds.eq(targets).sum().item() * 100.0 / targets.size(0)
+                correct += preds.eq(targets).cpu().sum()
+                total += targets.size(0)
 
                 if local_rank <= 0:
                     swanlab.log({
@@ -272,11 +282,11 @@ class TagFex(BaseLearner):
                         f"{task_prefix}/train_acc": batch_acc,
                         f"{task_prefix}/clf_loss": loss_clf.item(),
                         f"{task_prefix}/aux_loss": loss_aux.item(),
-                        f"{task_prefix}/lr": optimizer.param_groups[0]['lr'],
                         f"{task_prefix}/epoch": epoch,
                     }, step=batch_step)
                     batch_step += 1
 
+            scheduler.step()
             if not disable_tqdm:
                 train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
                 prog_bar.set_description(

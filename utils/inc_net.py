@@ -1,4 +1,5 @@
 import copy
+from copy import deepcopy
 import logging
 import torch
 from torch import nn
@@ -617,10 +618,15 @@ class TagFexNet(nn.Module):
 
         self._device = args["device"][0]
         self.ta_net = get_convnet(args).to(self._device)  # Task-agnostic Model (fta)
-
+        #hasattr判断“一个对象有没有某个属性”
         if hasattr(self.ta_net, 'fc'):
             self.ta_net.fc = None
+
+        self.fusion_type = self.args.get("fusion_type", "ts_attention")
+        self.replace_ta_with_task0_ts = self.args.get("replace_ta_with_task0_ts", False)
+        self.task0_ta_substitute = None
         self.ts_attn = None  # Merge Attention 模块
+        self.fusion_linear = None
         self.trans_classifier = None  # 融合特征分类器，用于计算图中的 L_mcls
         #将 TA 特征映射到高维空间，用于计算 L_ta
         self.projector = nn.Sequential(
@@ -640,7 +646,7 @@ class TagFexNet(nn.Module):
 
     @property
     def ta_feature_dim(self):
-        return self.ta_net.out_dim #512
+        return self._get_active_ta_model().out_dim #512
 
     #计算fs最后拼接完的特征长度
     @property
@@ -667,8 +673,9 @@ class TagFexNet(nn.Module):
         aux_logits = self.aux_fc(features[:, -self.out_dim :])
 
         out.update({"aux_logits": aux_logits, "features": features})
-        
-        ta_fmap = self.ta_net(x)['fmaps'][-1] # (bs, C, H, W)  [bs, 512, 4, 4]
+        #取出最后一层的特征图
+        ta_model = self._get_active_ta_model()
+        ta_fmap = ta_model(x)['fmaps'][-1] # (bs, C, H, W)  [bs, 512, 4, 4]
         ta_feature = ta_fmap.flatten(2).permute(0, 2, 1).mean(1) # (bs, H*W, C) -mean-> (bs, C)  (bs, 512)
         #print(ta_feature)
         #assert 0
@@ -682,7 +689,7 @@ class TagFexNet(nn.Module):
         if self.trans_classifier is not None:
             ts_feature = ts_outs[-1]["fmaps"][-1].flatten(2).permute(0, 2, 1)
             ta_features = ta_fmap.flatten(2).permute(0, 2, 1)# (bs, H*W, C) 
-            merged_feature = self.ts_attn(ta_features.detach(), ts_feature).mean(1)
+            merged_feature = self._merge_ta_ts_features(ta_features.detach(), ts_feature)
             trans_logits = self.trans_classifier(merged_feature)
             out.update(trans_logits=trans_logits)
 
@@ -708,9 +715,11 @@ class TagFexNet(nn.Module):
             self.convnets.append(get_convnet(self.args).to(self._device))
         else:
             self.convnets.append(get_convnet(self.args).to(self._device))
+            #新 task 的 TS 模型不是随机初始化，而是：旧 TS 模型 + TA 模型 的加权融合
             #init_interpolation_factor:初始插值系数
             init_interpolation_factor = self.args["init_interpolation_factor"]
-            for ts_old_parameter, ts_new_parameter, ta_prarameter in zip(self.convnets[-2].parameters(), self.convnets[-1].parameters(), self.ta_net.parameters()):
+            ta_model = self._get_active_ta_model()
+            for ts_old_parameter, ts_new_parameter, ta_prarameter in zip(self.convnets[-2].parameters(), self.convnets[-1].parameters(), ta_model.parameters()):
                 ts_new_parameter.data = init_interpolation_factor * ts_old_parameter.data + (1 - init_interpolation_factor) * ta_prarameter.data
 
         if self.out_dim is None:
@@ -734,12 +743,27 @@ class TagFexNet(nn.Module):
         """new added"""
         if self.predictor is None:
             self.predictor = self.generate_fc(self.ta_feature_dim, self.ta_feature_dim).to(self._device)
-        if self.ts_attn is None:
-            self.ts_attn = TSAttention(self.out_dim, self.args['attn_num_heads'], device=self._device)##
+        if self.fusion_type == "ts_attention":
+            if self.ts_attn is None:
+                self.ts_attn = TSAttention(self.out_dim, self.args['attn_num_heads'], device=self._device)
+            else:
+                self.ts_attn._reset_parameters()
+        elif self.fusion_type == "concat_linear":
+            if self.fusion_linear is None:
+                self.fusion_linear = TagFex_SimpleLinear(self.out_dim * 2, self.out_dim).to(self._device)
+            else:
+                self.fusion_linear.reset_parameters()
+        elif self.fusion_type == "mean":
+            pass
         else:
-            self.ts_attn._reset_parameters()
-            # trans_classifier is the merged classifier
-        self.trans_classifier = self.generate_fc(self.ta_net.out_dim, new_task_size).to(self._device)
+            raise ValueError("Unknown fusion_type: {}".format(self.fusion_type))
+        self.trans_classifier = self.generate_fc(self.ta_feature_dim, new_task_size).to(self._device)
+
+        if self.replace_ta_with_task0_ts and self.task0_ta_substitute is None and len(self.convnets) > 0:
+            self.task0_ta_substitute = deepcopy(self.convnets[0]).to(self._device)
+            for p in self.task0_ta_substitute.parameters():
+                p.requires_grad_(False)
+            self.task0_ta_substitute.eval()
 
     def generate_fc(self, in_dim, out_dim):
         fc = TagFex_SimpleLinear(in_dim, out_dim).to(self._device)
@@ -757,7 +781,7 @@ class TagFexNet(nn.Module):
         return self
     def get_freezed_copy_ta(self):
         from copy import deepcopy
-        ta_net_copy = deepcopy(self.ta_net)
+        ta_net_copy = deepcopy(self._get_active_ta_model()) 
         for p in ta_net_copy.parameters():
             p.requires_grad_(False)
         return ta_net_copy.eval()
@@ -774,6 +798,22 @@ class TagFexNet(nn.Module):
             param.requires_grad = False
         self.convnets.eval()
 
+    def _merge_ta_ts_features(self, ta_features, ts_feature):
+        if self.fusion_type == "ts_attention":
+            return self.ts_attn(ta_features, ts_feature).mean(1)
+        if self.fusion_type == "concat_linear":
+            merged = torch.cat([ta_features, ts_feature], dim=-1)
+            return self.fusion_linear(merged).mean(1)
+        if self.fusion_type == "mean":
+            return (ta_features + ts_feature).mean(1)
+        raise ValueError("Unknown fusion_type: {}".format(self.fusion_type))
+
+    def _get_active_ta_model(self):
+        if self.replace_ta_with_task0_ts and self.task0_ta_substitute is not None:
+            return self.task0_ta_substitute
+        return self.ta_net
+
+    #权重对齐
     def weight_align(self, increment):
         weights = self.fc.weight.data
         newnorm = torch.norm(weights[-increment:, :], p=2, dim=1)
@@ -793,12 +833,409 @@ class TagFexNet(nn.Module):
         test_acc = model_infos['test_acc']
         return test_acc
 
+
+class TagFexSimplifiedNet(nn.Module):
+    def __init__(self, args, pretrained):
+        super(TagFexSimplifiedNet, self).__init__()
+        self.args = args
+        self.pretrained = pretrained
+        self._device = args["device"][0]
+
+        self.convnets = nn.ModuleList()
+        self.ta_net = get_convnet(args).to(self._device)
+        if hasattr(self.ta_net, "fc"):
+            self.ta_net.fc = None
+
+        self.out_dim = None
+        self.fc = None
+        self.aux_fc = None
+        self.task_sizes = []
+        self.projector = nn.Sequential(
+            TagFex_SimpleLinear(self.ta_feature_dim, self.args["proj_hidden_dim"]),
+            nn.BatchNorm1d(self.args["proj_hidden_dim"]),
+            nn.ReLU(True),
+            TagFex_SimpleLinear(self.args["proj_hidden_dim"], self.args["proj_hidden_dim"]),
+            nn.BatchNorm1d(self.args["proj_hidden_dim"]),
+            nn.ReLU(True),
+            TagFex_SimpleLinear(self.args["proj_hidden_dim"], self.args["proj_output_dim"]),
+            nn.BatchNorm1d(self.args["proj_output_dim"]),
+        ).to(self._device)
+        self.predictor = None
+
+    @property
+    def ta_feature_dim(self):
+        return self.ta_net.out_dim
+
+    @property
+    def feature_dim(self):
+        if self.out_dim is None:
+            return 0
+        return self.out_dim * len(self.convnets)
+
+    def extract_vector(self, x):
+        features = [convnet(x)["features"] for convnet in self.convnets]
+        return torch.cat(features, 1)
+
+    def forward(self, x):
+        ts_outs = [convnet(x) for convnet in self.convnets]
+        features = [ts_out["features"] for ts_out in ts_outs]
+        features = torch.cat(features, 1)
+
+        out = {
+            "logits": self.fc(features),
+            "features": features,
+        }
+        out["aux_logits"] = self.aux_fc(features[:, -self.out_dim :])
+
+        ta_fmap = self.ta_net(x)["fmaps"][-1]
+        ta_feature = ta_fmap.flatten(2).permute(0, 2, 1).mean(1)
+        out["ta_feature"] = ta_feature
+        out["embedding"] = self.projector(ta_feature)
+
+        if self.predictor is not None:
+            out["predicted_feature"] = self.predictor(ta_feature)
+
+        return out
+
+    def update_fc(self, nb_classes):
+        if len(self.convnets) == 0:
+            self.convnets.append(get_convnet(self.args).to(self._device))
+        else:
+            self.convnets.append(get_convnet(self.args).to(self._device))
+            init_interpolation_factor = self.args["init_interpolation_factor"]
+            for ts_old_parameter, ts_new_parameter, ta_parameter in zip(
+                self.convnets[-2].parameters(),
+                self.convnets[-1].parameters(),
+                self.ta_net.parameters(),
+            ):
+                ts_new_parameter.data = (
+                    init_interpolation_factor * ts_old_parameter.data
+                    + (1 - init_interpolation_factor) * ta_parameter.data
+                )
+
+        if self.out_dim is None:
+            self.out_dim = self.convnets[-1].out_dim
+
+        fc = self.generate_fc(self.feature_dim, nb_classes).to(self._device)
+        if self.fc is not None:
+            nb_output = self.fc.out_features
+            weight = copy.deepcopy(self.fc.weight.data)
+            bias = copy.deepcopy(self.fc.bias.data)
+            fc.weight.data[:nb_output, : self.feature_dim - self.out_dim] = weight
+            fc.bias.data[:nb_output] = bias
+        del self.fc
+        self.fc = fc
+
+        new_task_size = nb_classes - sum(self.task_sizes)
+        self.task_sizes.append(new_task_size)
+        self.aux_fc = self.generate_fc(self.out_dim, new_task_size + 1).to(self._device)
+
+        if self.predictor is None:
+            self.predictor = self.generate_fc(self.ta_feature_dim, self.ta_feature_dim).to(self._device)
+
+    def generate_fc(self, in_dim, out_dim):
+        return TagFex_SimpleLinear(in_dim, out_dim).to(self._device)
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+        return self
+
+    def get_freezed_copy_ta(self):
+        ta_net_copy = deepcopy(self.ta_net)
+        for p in ta_net_copy.parameters():
+            p.requires_grad_(False)
+        return ta_net_copy.eval()
+
+    def get_freezed_copy_projector(self):
+        projector_copy = deepcopy(self.projector)
+        for p in projector_copy.parameters():
+            p.requires_grad_(False)
+        return projector_copy.eval()
+
+    def weight_align(self, increment):
+        weights = self.fc.weight.data
+        newnorm = torch.norm(weights[-increment:, :], p=2, dim=1)
+        oldnorm = torch.norm(weights[:-increment, :], p=2, dim=1)
+        meannew = torch.mean(newnorm)
+        meanold = torch.mean(oldnorm)
+        gamma = meanold / meannew
+        print("alignweights,gamma=", gamma)
+        self.fc.weight.data[-increment:, :] *= gamma
+
+
+class TagFexTask0TSReplaceNet(nn.Module):
+    def __init__(self, args, pretrained, use_transfer_branch=True):
+        super(TagFexTask0TSReplaceNet, self).__init__()
+        self.args = args
+        self.pretrained = pretrained
+        self._device = args["device"][0]
+        self.use_transfer_branch = use_transfer_branch
+
+        self.convnets = nn.ModuleList()
+        self.task0_ta_substitute = None
+        self.out_dim = None
+        self.fc = None
+        self.aux_fc = None
+        self.task_sizes = []
+        self.ts_attn = None
+        self.trans_classifier = None
+
+    @property
+    def feature_dim(self):
+        if self.out_dim is None:
+            return 0
+        return self.out_dim * len(self.convnets)
+
+    @property
+    def ta_feature_dim(self):
+        if self.out_dim is not None:
+            return self.out_dim
+        if self.task0_ta_substitute is not None:
+            return self.task0_ta_substitute.out_dim
+        return 0
+
+    def extract_vector(self, x):
+        features = [convnet(x)["features"] for convnet in self.convnets]
+        return torch.cat(features, 1)
+
+    def _build_task0_ta_substitute(self):
+        if self.task0_ta_substitute is None and len(self.convnets) > 0:
+            self.task0_ta_substitute = deepcopy(self.convnets[0]).to(self._device)
+            for p in self.task0_ta_substitute.parameters():
+                p.requires_grad_(False)
+            self.task0_ta_substitute.eval()
+
+    def _get_ta_substitute(self):
+        if self.task0_ta_substitute is not None:
+            return self.task0_ta_substitute
+        return None
+
+    def forward(self, x):
+        ts_outs = [convnet(x) for convnet in self.convnets]
+        features = [ts_out["features"] for ts_out in ts_outs]
+        features = torch.cat(features, 1)
+
+        out = {
+            "logits": self.fc(features),
+            "features": features,
+        }
+        out["aux_logits"] = self.aux_fc(features[:, -self.out_dim :])
+
+        if self.use_transfer_branch and self.trans_classifier is not None and self.task0_ta_substitute is not None:
+            with torch.no_grad():
+                ta_fmap = self.task0_ta_substitute(x)["fmaps"][-1]
+            ts_feature = ts_outs[-1]["fmaps"][-1].flatten(2).permute(0, 2, 1)
+            ta_features = ta_fmap.flatten(2).permute(0, 2, 1)
+            merged_feature = self.ts_attn(ta_features, ts_feature).mean(1)
+            out["trans_logits"] = self.trans_classifier(merged_feature)
+
+        return out
+
+    def update_fc(self, nb_classes):
+        if len(self.convnets) == 0:
+            self.convnets.append(get_convnet(self.args).to(self._device))
+        else:
+            self._build_task0_ta_substitute()
+            self.convnets.append(get_convnet(self.args).to(self._device))
+            init_interpolation_factor = self.args["init_interpolation_factor"]
+            ta_model = self.task0_ta_substitute
+            for ts_old_parameter, ts_new_parameter, ta_parameter in zip(
+                self.convnets[-2].parameters(),
+                self.convnets[-1].parameters(),
+                ta_model.parameters(),
+            ):
+                ts_new_parameter.data = (
+                    init_interpolation_factor * ts_old_parameter.data
+                    + (1 - init_interpolation_factor) * ta_parameter.data
+                )
+
+        if self.out_dim is None:
+            self.out_dim = self.convnets[-1].out_dim
+
+        fc = self.generate_fc(self.feature_dim, nb_classes).to(self._device)
+        if self.fc is not None:
+            nb_output = self.fc.out_features
+            weight = copy.deepcopy(self.fc.weight.data)
+            bias = copy.deepcopy(self.fc.bias.data)
+            fc.weight.data[:nb_output, : self.feature_dim - self.out_dim] = weight
+            fc.bias.data[:nb_output] = bias
+        del self.fc
+        self.fc = fc
+
+        new_task_size = nb_classes - sum(self.task_sizes)
+        self.task_sizes.append(new_task_size)
+        self.aux_fc = self.generate_fc(self.out_dim, new_task_size + 1).to(self._device)
+
+        if self.use_transfer_branch:
+            if self.ts_attn is None:
+                self.ts_attn = TSAttention(self.out_dim, self.args["attn_num_heads"], device=self._device)
+            else:
+                self.ts_attn._reset_parameters()
+            self.trans_classifier = self.generate_fc(self.out_dim, new_task_size).to(self._device)
+
+    def generate_fc(self, in_dim, out_dim):
+        return TagFex_SimpleLinear(in_dim, out_dim).to(self._device)
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+        return self
+
+    def weight_align(self, increment):
+        weights = self.fc.weight.data
+        newnorm = torch.norm(weights[-increment:, :], p=2, dim=1)
+        oldnorm = torch.norm(weights[:-increment, :], p=2, dim=1)
+        meannew = torch.mean(newnorm)
+        meanold = torch.mean(oldnorm)
+        gamma = meanold / meannew
+        print("alignweights,gamma=", gamma)
+        self.fc.weight.data[-increment:, :] *= gamma
+
+
+class TACLSNet(nn.Module):
+    def __init__(self, args, pretrained=False):
+        super(TACLSNet, self).__init__()
+        self.args = args
+        self.pretrained = pretrained
+        self._device = args["device"][0]
+
+        self.ta_net = get_convnet(args).to(self._device)
+        if hasattr(self.ta_net, "fc"):
+            self.ta_net.fc = None
+
+        self.fc = None
+        self.projector = nn.Sequential(
+            TagFex_SimpleLinear(self.ta_feature_dim, self.args["proj_hidden_dim"]),
+            nn.BatchNorm1d(self.args["proj_hidden_dim"]),
+            nn.ReLU(True),
+            TagFex_SimpleLinear(self.args["proj_hidden_dim"], self.args["proj_hidden_dim"]),
+            nn.BatchNorm1d(self.args["proj_hidden_dim"]),
+            nn.ReLU(True),
+            TagFex_SimpleLinear(self.args["proj_hidden_dim"], self.args["proj_output_dim"]),
+            nn.BatchNorm1d(self.args["proj_output_dim"]),
+        ).to(self._device)
+        self.predictor = None
+
+    @property
+    def ta_feature_dim(self):
+        return self.ta_net.out_dim
+
+    @property
+    def feature_dim(self):
+        return self.ta_feature_dim
+
+    def extract_vector(self, x):
+        ta_fmap = self.ta_net(x)["fmaps"][-1]
+        return ta_fmap.flatten(2).permute(0, 2, 1).mean(1)
+
+    def forward(self, x):
+        x.to(self._device)
+        ta_out = self.ta_net(x)
+        ta_fmap = ta_out["fmaps"][-1]
+        ta_feature = ta_fmap.flatten(2).permute(0, 2, 1).mean(1)
+        embedding = self.projector(ta_feature)
+
+        out = {
+            "ta_feature": ta_feature,
+            "embedding": embedding,
+            "logits": self.fc(ta_feature),
+        }
+
+        if self.predictor is not None:
+            out["predicted_feature"] = self.predictor(ta_feature)
+
+        return out
+
+    def update_fc(self, nb_classes):
+        fc = self.generate_fc(self.feature_dim, nb_classes).to(self._device)
+        if self.fc is not None:
+            nb_output = self.fc.out_features
+            weight = copy.deepcopy(self.fc.weight.data)
+            bias = copy.deepcopy(self.fc.bias.data)
+            fc.weight.data[:nb_output] = weight
+            fc.bias.data[:nb_output] = bias
+
+        del self.fc
+        self.fc = fc
+
+        if self.predictor is None:
+            self.predictor = self.generate_fc(self.ta_feature_dim, self.ta_feature_dim).to(self._device)
+
+    def generate_fc(self, in_dim, out_dim):
+        return TagFex_SimpleLinear(in_dim, out_dim).to(self._device)
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+        return self
+
+    def get_freezed_copy_ta(self):
+        from copy import deepcopy
+        ta_net_copy = deepcopy(self.ta_net)
+        for p in ta_net_copy.parameters():
+            p.requires_grad_(False)
+        return ta_net_copy.eval()
+
+    def get_freezed_copy_projector(self):
+        from copy import deepcopy
+        projector_copy = deepcopy(self.projector)
+        for p in projector_copy.parameters():
+            p.requires_grad_(False)
+        return projector_copy.eval()
+
+    def weight_align(self, increment):
+        weights = self.fc.weight.data
+        newnorm = torch.norm(weights[-increment:, :], p=2, dim=1)
+        oldnorm = torch.norm(weights[:-increment, :], p=2, dim=1)
+        meannew = torch.mean(newnorm)
+        meanold = torch.mean(oldnorm)
+        gamma = meanold / meannew
+        print("alignweights,gamma=", gamma)
+        self.fc.weight.data[-increment:, :] *= gamma
+
+
+class TACLSDetachNet(TACLSNet):
+    def __init__(self, args, pretrained=False):
+        super(TACLSDetachNet, self).__init__(args, pretrained)
+
+    def forward(self, x):
+        x.to(self._device)
+        ta_out = self.ta_net(x)
+        ta_fmap = ta_out["fmaps"][-1]
+        ta_feature = ta_fmap.flatten(2).permute(0, 2, 1).mean(1)
+        embedding = self.projector(ta_feature)
+
+        out = {
+            "ta_feature": ta_feature,
+            "embedding": embedding,
+            "logits": self.fc(ta_feature.detach()),
+        }
+
+        if self.predictor is not None:
+            out["predicted_feature"] = self.predictor(ta_feature)
+
+        return out
+
 class TSAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, device) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
 
+        #创建两个 LayerNorm 模块
         self.norm_ts = nn.LayerNorm(embed_dim, device=device)
         self.norm_ta = nn.LayerNorm(embed_dim, device=device)
 

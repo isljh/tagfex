@@ -1,16 +1,9 @@
-print("开始 import")
 import json
-print("json OK")
 import argparse
-print("argparse OK")
 import os
-print("os OK")
 import torch
-print("torch OK")
 import torch.distributed as dist
-print("dist OK")
 from trainer import train
-print("trainer OK")
 
 def main():
     print("开始执行 main.py")
@@ -65,6 +58,9 @@ def setup_parser():
     parser.add_argument('--dataset', type=str)
     parser.add_argument('--init_cls', type=int)
     parser.add_argument('--increment', type=int)
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--resume_dir', type=str, default=None)
+    parser.add_argument('--auto_resume', action='store_true')
     # 注意：DDP 模式下 --device 应当被弃用，由 torchrun 控制
     parser.add_argument('--device', type=str, help='Deprecated in DDP mode')
     return parser

@@ -9,6 +9,7 @@ import os
 import numpy as np
 import time
 
+
 def train(args):
     seed_list = copy.deepcopy(args["seed"])
     device = copy.deepcopy(args["device"])
@@ -25,17 +26,25 @@ def _train(args):
     local_rank = args.get("local_rank", 0)
 
     init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
+    log_root = "logs/{}/{}/{}/{}".format(
+        args["prefix"], args["dataset"], init_cls, args["increment"]
+    )
+    resume_path = _resolve_resume_path(args, log_root)
 
     # 1. 只有主进程创建文件夹
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    logs_name = "logs/{}/{}/{}/{}/{}".format(args["model_name"], args["dataset"], init_cls, args['increment'], timestamp)
+    if resume_path:
+        logs_name = os.path.dirname(os.path.dirname(resume_path))
+        timestamp = os.path.basename(logs_name)
+    else:
+        logs_name = "logs/{}/{}/{}/{}/{}".format(args["prefix"], args["dataset"], init_cls, args['increment'], timestamp)
     if local_rank <= 0:
         if not os.path.exists(logs_name):
             os.makedirs(logs_name)
 
-    logfilename = "logs/{}/{}/{}/{}/{}/{}_{}_{}".format(
-        args["model_name"], args["dataset"], init_cls, args["increment"],timestamp,
-        args["prefix"], args["seed"], args["convnet_type"],
+    logfilename = os.path.join(
+        logs_name,
+        "{}_{}_{}".format(args["prefix"], args["seed"], args["convnet_type"]),
     )
 
     # 2. 日志配置：只有 local_rank 0 打印到控制台和文件，其他进程保持静默
@@ -75,33 +84,29 @@ def _train(args):
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
     cnn_matrix, nme_matrix = [], []
+    start_task = 0
+
+    if resume_path:
+        start_task, history_state = _resume_from_checkpoint(model, data_manager, resume_path)
+        cnn_curve = history_state["cnn_curve"]
+        nme_curve = history_state["nme_curve"]
+        cnn_matrix = history_state["cnn_matrix"]
+        nme_matrix = history_state["nme_matrix"]
+        if local_rank <= 0:
+            logging.info("Resume from checkpoint: {}".format(resume_path))
+            logging.info("Resuming from task index {}".format(start_task))
 
     # 6. 开始任务循环
-    for task in range(data_manager.nb_tasks):
+    for task in range(start_task, data_manager.nb_tasks):
         if local_rank <= 0:
             logging.info("All params: {}".format(count_parameters(model._network)))
             logging.info("Trainable params: {}".format(count_parameters(model._network, True)))
 
         # 增量训练
         model.incremental_train(data_manager)
+        #accy是字典
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
-
-        # ======= 在这里插入强制保存权重的逻辑 =======
-        if local_rank <= 0:
-            # 自动生成权重保存路径
-            ckpt_dir = os.path.join(logs_name, "checkpoints")
-            if not os.path.exists(ckpt_dir):
-                os.makedirs(ckpt_dir)
-
-            save_path = os.path.join(ckpt_dir, "{}_{}_task_{}.pth".format(
-                args["prefix"], args["seed"], task
-            ))
-
-            # 执行保存
-            torch.save(model._network.state_dict(), save_path)
-            logging.info("!!! Model checkpoint saved to: {} !!!".format(save_path))
-        # =========================================
 
         # 只有主进程收集并打印当前任务的结果
         if local_rank <= 0:
@@ -140,6 +145,23 @@ def _train(args):
                 cnn_curve["top5"].append(cnn_accy["top5"])
                 logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
                 logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"]) / len(cnn_curve["top1"])))
+
+            ckpt_dir = os.path.join(logs_name, "checkpoints")
+            if not os.path.exists(ckpt_dir):
+                os.makedirs(ckpt_dir)
+
+            save_path = os.path.join(ckpt_dir, "{}_{}_task_{}.pth".format(
+                args["prefix"], args["seed"], task
+            ))
+
+            history_state = {
+                "cnn_curve": cnn_curve,
+                "nme_curve": nme_curve,
+                "cnn_matrix": cnn_matrix,
+                "nme_matrix": nme_matrix,
+            }
+            _save_resume_checkpoint(model, save_path, task, history_state)
+            logging.info("!!! Model checkpoint saved to: {} !!!".format(save_path))
 
     # 7. 训练结束，主进程汇总 Accuracy Matrix 和 Forgetting
     if local_rank <= 0:
@@ -188,3 +210,108 @@ def _set_random(seed=1):
 def print_args(args):
     for key, value in args.items():
         logging.info("{}: {}".format(key, value))
+
+
+def _save_resume_checkpoint(model, save_path, task, history_state=None):
+    network = model._network.module if hasattr(model._network, "module") else model._network
+    history_state = history_state or {}
+    ckpt = {
+        "task": task,
+        "cur_task": model._cur_task,
+        "known_classes": model._known_classes,
+        "total_classes": model._total_classes,
+        "model_state_dict": network.state_dict(),
+        "data_memory": model._data_memory,
+        "targets_memory": model._targets_memory,
+        "class_means": getattr(model, "_class_means", None),
+        "cnn_curve": history_state.get("cnn_curve", {"top1": [], "top5": []}),
+        "nme_curve": history_state.get("nme_curve", {"top1": [], "top5": []}),
+        "cnn_matrix": history_state.get("cnn_matrix", []),
+        "nme_matrix": history_state.get("nme_matrix", []),
+    }
+    torch.save(ckpt, save_path)
+
+
+def _resume_from_checkpoint(model, data_manager, resume_path):
+    ckpt = torch.load(resume_path, map_location="cpu")
+    if "model_state_dict" not in ckpt:
+        raise ValueError("Checkpoint {} is not a resumable task checkpoint.".format(resume_path))
+
+    saved_task = ckpt["task"]
+    total_classes = 0
+    for task_id in range(saved_task + 1):
+        total_classes += data_manager.get_task_size(task_id)
+        model._network.update_fc(total_classes)
+
+    model._network.load_state_dict(ckpt["model_state_dict"])
+    model._cur_task = ckpt.get("cur_task", saved_task)
+    model._known_classes = ckpt["known_classes"]
+    model._total_classes = ckpt["total_classes"]
+    model._data_memory = ckpt.get("data_memory", np.array([]))
+    model._targets_memory = ckpt.get("targets_memory", np.array([]))
+
+    class_means = ckpt.get("class_means", None)
+    if class_means is not None:
+        model._class_means = class_means
+
+    model.after_task()
+    history_state = {
+        "cnn_curve": ckpt.get("cnn_curve", {"top1": [], "top5": []}),
+        "nme_curve": ckpt.get("nme_curve", {"top1": [], "top5": []}),
+        "cnn_matrix": ckpt.get("cnn_matrix", []),
+        "nme_matrix": ckpt.get("nme_matrix", []),
+    }
+    return saved_task + 1, history_state
+
+
+def _resolve_resume_path(args, log_root):
+    resume_path = args.get("resume")
+    resume_dir = args.get("resume_dir")
+    auto_resume = args.get("auto_resume", False)
+
+    if resume_path:
+        return resume_path
+
+    if resume_dir:
+        return _find_latest_checkpoint_in_dir(resume_dir)
+
+    if auto_resume:
+        if not os.path.exists(log_root):
+            raise FileNotFoundError(
+                "Auto resume requested, but log root does not exist: {}".format(log_root)
+            )
+        run_dirs = [
+            os.path.join(log_root, d)
+            for d in os.listdir(log_root)
+            if os.path.isdir(os.path.join(log_root, d))
+        ]
+        if len(run_dirs) == 0:
+            raise FileNotFoundError(
+                "Auto resume requested, but no run directories were found under {}".format(log_root)
+            )
+        latest_run_dir = max(run_dirs, key=os.path.getmtime)
+        return _find_latest_checkpoint_in_dir(latest_run_dir)
+
+    return None
+
+
+def _find_latest_checkpoint_in_dir(run_dir):
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    if not os.path.exists(ckpt_dir):
+        raise FileNotFoundError("Checkpoint directory not found: {}".format(ckpt_dir))
+
+    ckpt_files = [
+        os.path.join(ckpt_dir, f)
+        for f in os.listdir(ckpt_dir)
+        if f.endswith(".pth") and "_task_" in f
+    ]
+    if len(ckpt_files) == 0:
+        raise FileNotFoundError("No task checkpoints found under {}".format(ckpt_dir))
+
+    def _task_index(path):
+        filename = os.path.basename(path)
+        task_part = filename.rsplit("_task_", 1)[-1]
+        task_str = task_part.split(".pth")[0]
+        return int(task_str)
+
+    return max(ckpt_files, key=_task_index)

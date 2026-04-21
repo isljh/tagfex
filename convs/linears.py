@@ -48,6 +48,7 @@ class TagFex_SimpleLinear(nn.Module):
         super(TagFex_SimpleLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
+        #W矩阵
         self.weight = nn.Parameter(torch.empty(out_features, in_features, **factory_kwargs))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
@@ -56,6 +57,7 @@ class TagFex_SimpleLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        #Kaiming 初始化
         nn.init.kaiming_uniform_(self.weight, nonlinearity='linear')
         if self.bias is not None:
             nn.init.zeros_(self.bias)

@@ -79,6 +79,7 @@ class BaseLearner(object):
 
     def eval_task(self, save_conf=False):
         y_pred, y_true = self._eval_cnn(self.test_loader)
+        #cnn_accy是一个字典
         cnn_accy = self._evaluate(y_pred, y_true)
 
         if hasattr(self, "_class_means"):
@@ -106,6 +107,7 @@ class BaseLearner(object):
         else:
             return (self._data_memory, self._targets_memory)
 
+    #loader = test_loader
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
@@ -113,17 +115,22 @@ class BaseLearner(object):
             inputs = inputs.to(self._device)
             with torch.no_grad():
                 outputs = self._network(inputs)["logits"]
+            #predicts.shape = (batch_size, topk)
             predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
+        ##y_pred.shape = (N, topk)   y_true.shape = (N,)
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def _eval_nme(self, loader, class_means):
         self._network.eval()
         vectors, y_true = self._extract_vectors(loader)
         vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
+        #dists.shape = (C, N)
         dists = cdist(class_means, vectors, "sqeuclidean")
+        #score.shape = (N，C)
         scores = dists.T
+        #预测结果形状(N, topk)
         return np.argsort(scores, axis=1)[:, : self.topk], y_true
 
     # --- 这里是刚才修复的地方：添加了函数头并校准缩进 ---
@@ -159,16 +166,19 @@ class BaseLearner(object):
             )
             vectors.append(_vectors)
             targets.append(_targets)
+        #假设现在跑完了task1，返回的特征就是(样本数量, 1024)    样本数量
         return np.concatenate(vectors), np.concatenate(targets)
 
     def _reduce_exemplar(self, data_manager, m):
         logging.info("Reducing exemplars...({} per classes)".format(m))
         dummy_data, dummy_targets = copy.deepcopy(self._data_memory), copy.deepcopy(self._targets_memory)
+        #task1之后_class_means(20, 1024)
         self._class_means = np.zeros((self._total_classes, self.feature_dim))
         self._data_memory, self._targets_memory = np.array([]), np.array([])
-
+        #_known_classes=10
         for class_idx in range(self._known_classes):
             mask = np.where(dummy_targets == class_idx)[0]
+            #直接保留旧 memory 里前 m 个
             dd, dt = dummy_data[mask][:m], dummy_targets[mask][:m]
             self._data_memory = np.concatenate((self._data_memory, dd)) if len(self._data_memory) != 0 else dd
             self._targets_memory = np.concatenate((self._targets_memory, dt)) if len(self._targets_memory) != 0 else dt
@@ -181,13 +191,19 @@ class BaseLearner(object):
             mean = mean / np.linalg.norm(mean)
             self._class_means[class_idx, :] = mean
 
+    #m就指的是计算出来的每个类需要保存的数量 Constructing exemplars...(66 per classes)
     def _construct_exemplar(self, data_manager, m):
         logging.info("Constructing exemplars...({} per classes)".format(m))
+        #task0之后，选取[0,1,2,...,9]
+        #task1之后，选取[10,11,12,...,19]
         for class_idx in range(self._known_classes, self._total_classes):
             data, targets, idx_dataset = data_manager.get_dataset(np.arange(class_idx, class_idx + 1), source="train", mode="test", ret_data=True)
             idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+            #vectors:[所有样本数量，拼接起来的特征维度]  (N，feature_dim)
             vectors, _ = self._extract_vectors(idx_loader)
+            #对每一个样本的特征向量做 L2 归一化（单位化），每个向量长度变成 1
             vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
+            #当前这个类别在特征空间中的“中心点”
             class_mean = np.mean(vectors, axis=0)
 
             selected_exemplars, exemplar_vectors = [], []
@@ -200,11 +216,14 @@ class BaseLearner(object):
                 vectors = np.delete(vectors, i, axis=0)
                 data = np.delete(data, i, axis=0)
 
+            #当前这个“类”刚选出来的 m 个样本
             selected_exemplars = np.array(selected_exemplars)
             exemplar_targets = np.full(m, class_idx)
+            #所有“历史类”累计的 exemplar
             self._data_memory = np.concatenate((self._data_memory, selected_exemplars)) if len(self._data_memory) != 0 else selected_exemplars
             self._targets_memory = np.concatenate((self._targets_memory, exemplar_targets)) if len(self._targets_memory) != 0 else exemplar_targets
 
+            #idx_dataset = 只包含当前类 m 个 exemplar 的 Dataset
             idx_dataset = data_manager.get_dataset([], source="train", mode="test", appendent=(selected_exemplars, exemplar_targets))
             idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
             vectors, _ = self._extract_vectors(idx_loader)

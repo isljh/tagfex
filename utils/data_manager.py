@@ -14,6 +14,7 @@ class DataManager(object):
         self.aug = aug
         self._setup_data(dataset_name, shuffle, seed)
         assert init_cls <= len(self._class_order), "No enough classes."
+        #_increments列表[10,10,10...]
         self._increments = [init_cls]
         while sum(self._increments) + increment < len(self._class_order):
             self._increments.append(increment)
@@ -36,7 +37,8 @@ class DataManager(object):
         return len(self._class_order)
 
     def get_dataset(
-        # appendent: 一个包含旧知识的元组 (old_data, old_targets)
+        # appendent: 额外拼接进来的旧样本exemplar memory (old_data, old_targets)
+        # indices：当前要取哪些类别
         self, indices, source, mode, appendent=None, ret_data=False, m_rate=None
     ):
         if source == "train":
@@ -48,6 +50,7 @@ class DataManager(object):
 
         if mode == "train":
             trsf = transforms.Compose([*self._train_trsf, *self._common_trsf])
+        #flip模式常用于某些特征提取或测试时增强
         elif mode == "flip":
             trsf = transforms.Compose(
                 [
@@ -64,6 +67,7 @@ class DataManager(object):
         data, targets = [], []
         for idx in indices:
             if m_rate is None:
+                #data = [所有类0样本, 所有类1样本...] targets = [所有0标签, 所有1标签...]
                 class_data, class_targets = self._select(
                     x, y, low_range=idx, high_range=idx + 1
                 )
@@ -80,14 +84,13 @@ class DataManager(object):
             targets.append(appendent_targets)
 
         data, targets = np.concatenate(data), np.concatenate(targets)
-
+        #data = [所有类0样本, 所有类1样本...appendent_data] targets = [所有0标签, 所有1标签...appendent_targets]
         if ret_data:
             return data, targets, DummyDataset(data, targets, trsf, self.use_path,self.aug if source == "train" and mode == "train" else 1)
         else:
-            #---------------------self.aug没用了--------------------------------------------
             return DummyDataset(data, targets, trsf, self.use_path,self.aug if source == "train" and mode == "train" else 1)
 
-        
+    #为 finetune 专门做一个“比例受控”的数据集       
     def get_finetune_dataset(self,known_classes,total_classes,source,mode,appendent,type="ratio"):
         if source == 'train':
             x, y = self._train_data, self._train_targets
@@ -133,6 +136,7 @@ class DataManager(object):
         val_targets = np.concatenate(val_targets)
         return DummyDataset(val_data, val_targets, trsf, self.use_path, self.aug if source == "train" and mode == "train" else 1)
 
+    #训练集 + 验证集
     def get_dataset_with_split(
         self, indices, source, mode, appendent=None, val_samples_per_class=0
     ):
@@ -193,7 +197,7 @@ class DataManager(object):
         idata = _get_idata(dataset_name)
         idata.download_data()
 
-        # Data
+        # Data 格式numpy.ndarray
         self._train_data, self._train_targets = idata.train_data, idata.train_targets
         self._test_data, self._test_targets = idata.test_data, idata.test_targets
         self.use_path = idata.use_path
@@ -203,7 +207,7 @@ class DataManager(object):
         self._test_trsf = idata.test_trsf
         self._common_trsf = idata.common_trsf
 
-        # Order
+        # Order list：[0, 1, 2, ..., 99]
         order = [i for i in range(len(np.unique(self._train_targets)))]
         if shuffle:
             np.random.seed(seed)
@@ -213,7 +217,7 @@ class DataManager(object):
         self._class_order = order
         logging.info(self._class_order)
 
-        # Map indices
+        # Map indices 重新映射标签
         self._train_targets = _map_new_class_index(
             self._train_targets, self._class_order
         )
@@ -268,6 +272,7 @@ class DummyDataset(Dataset):
                 image = self.trsf(Image.fromarray(self.images[idx]))
             label = self.labels[idx]
             return idx, image, label
+        #idx, aug_view1, aug_view2, label
         else:
             if self.use_path:
                 images = [self.trsf(pil_loader(self.images[idx])) for _ in range(self.aug)]

@@ -38,7 +38,7 @@ def makedirs(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-
+#这里传入的y_pred指的是每个样本的top-1准确率
 def accuracy(y_pred, y_true, nb_old, increment=10):
     assert len(y_pred) == len(y_true), "Data length error."
     all_acc = {}
@@ -46,8 +46,10 @@ def accuracy(y_pred, y_true, nb_old, increment=10):
         (y_pred == y_true).sum() * 100 / len(y_true), decimals=2
     )
 
-    # Grouped accuracy
+    # Grouped accuracy class_id：0，10，20...
+    # "00-09": 67.5,"10-19": 62.3,...
     for class_id in range(0, np.max(y_true), increment):
+        #取出真实标签在这个范围内的样本
         idxes = np.where(
             np.logical_and(y_true >= class_id, y_true < class_id + increment)
         )[0]
