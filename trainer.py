@@ -211,6 +211,15 @@ def print_args(args):
     for key, value in args.items():
         logging.info("{}: {}".format(key, value))
 
+    run_mode = args.get("run_mode")
+    git_available = args.get("git_available")
+    git_dirty = args.get("git_dirty")
+    if run_mode == "debug" and git_available and git_dirty:
+        logging.warning(
+            "Running in debug mode with uncommitted changes. "
+            "This run is not a clean, fully reproducible experiment snapshot."
+        )
+
 
 def _save_resume_checkpoint(model, save_path, task, history_state=None):
     network = model._network.module if hasattr(model._network, "module") else model._network

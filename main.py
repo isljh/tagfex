@@ -1,9 +1,11 @@
 import json
 import argparse
 import os
+import sys
 import torch
 import torch.distributed as dist
 from trainer import train
+from utils.git_utils import collect_git_metadata, validate_git_run_mode
 
 def main():
     print("开始执行 main.py")
@@ -27,15 +29,27 @@ def main():
     args_dict = vars(args)
 
     # 2. 合并参数
-    for key in ['dataset', 'init_cls', 'increment']:
+    for key in ['dataset', 'init_cls', 'increment', 'run_mode']:
         if args_dict.get(key) is not None:
             param[key] = args_dict[key]
+
+    if "run_mode" not in param:
+        param["run_mode"] = "debug"
 
     # 3. 强制更新设备信息为当前进程分配的显卡
     # DDP 模式下，param['device'] 应该传给 trainer 当前进程的 ID
     param['device'] = device_id
     param['is_distributed'] = is_distributed
     param['local_rank'] = local_rank
+
+    git_metadata = collect_git_metadata(
+        cwd=os.getcwd(),
+        config_path=args.config,
+        argv=sys.argv,
+        run_mode=param["run_mode"],
+    )
+    validate_git_run_mode(git_metadata)
+    param.update(git_metadata)
 
     args_dict.update(param)
 
@@ -61,6 +75,7 @@ def setup_parser():
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--resume_dir', type=str, default=None)
     parser.add_argument('--auto_resume', action='store_true')
+    parser.add_argument('--run_mode', type=str, choices=['debug', 'exp'])
     # 注意：DDP 模式下 --device 应当被弃用，由 torchrun 控制
     parser.add_argument('--device', type=str, help='Deprecated in DDP mode')
     return parser
