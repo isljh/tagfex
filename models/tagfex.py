@@ -54,29 +54,50 @@ class TagFex(BaseLearner):
 
     def after_task(self):
         self._known_classes = self._total_classes
-        self.last_ta_net = self._network.get_freezed_copy_ta()
-        self.last_projector = self._network.get_freezed_copy_projector()
-        logging.info("Exemplar size: {}".format(self.exemplar_size))
+        ptr = self._network.module if hasattr(self._network, "module") else self._network
+        self.last_ta_net = ptr.get_freezed_copy_ta()
+        self.last_projector = ptr.get_freezed_copy_projector()
+        if self.args.get("local_rank", 0) <= 0:
+            logging.info("Exemplar size: {}".format(self.exemplar_size))
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(
             self._cur_task
         )
-        self._network.update_fc(self._total_classes)
-        logging.info(
-            "Learning on {}-{}".format(self._known_classes, self._total_classes)
-        )
+        ptr = self._network.module if hasattr(self._network, "module") else self._network
+        ptr.update_fc(self._total_classes)
+
+        local_rank = self.args.get("local_rank", 0)
+        is_distributed = self.args.get("is_distributed", False)
+
+        if is_distributed and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            current_batch_size = batch_size // world_size
+            if local_rank <= 0:
+                logging.info(
+                    "DDP Mode: Total batch size {} split into {} GPUs. Local batch size: {}".format(
+                        batch_size, world_size, current_batch_size
+                    )
+                )
+        else:
+            current_batch_size = batch_size
+
+        if local_rank <= 0:
+            logging.info(
+                "Learning on {}-{}".format(self._known_classes, self._total_classes)
+            )
 
         if self._cur_task > 0:
             for i in range(self._cur_task):
-                for p in self._network.convnets[i].parameters():
+                for p in ptr.convnets[i].parameters():
                     p.requires_grad = False
 
-        logging.info("All params: {}".format(count_parameters(self._network)))
-        logging.info(
-            "Trainable params: {}".format(count_parameters(self._network, True))
-        )
+        if local_rank <= 0:
+            logging.info("All params: {}".format(count_parameters(self._network)))
+            logging.info(
+                "Trainable params: {}".format(count_parameters(self._network, True))
+            )
 
         #最终数据 = 新类数据 + 旧类memory 
         train_dataset = data_manager.get_dataset(
@@ -85,29 +106,55 @@ class TagFex(BaseLearner):
             mode="train",
             appendent=self._get_memory(),
         )
+        train_sampler = (
+            torch.utils.data.distributed.DistributedSampler(train_dataset)
+            if is_distributed
+            else None
+        )
         self.train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, drop_last=True
+            train_dataset,
+            batch_size=current_batch_size,
+            shuffle=(train_sampler is None),
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            sampler=train_sampler,
         )
         test_dataset = data_manager.get_dataset(
             np.arange(0, self._total_classes), source="test", mode="test"
         )
         self.test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
+            test_dataset,
+            batch_size=current_batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
         )
 
-        if len(self._multiple_gpus) > 1:
-            self._network = nn.DataParallel(self._network, self._multiple_gpus)
+        if is_distributed:
+            self._network.to(self._device)
+            if not hasattr(self._network, "module"):
+                self._network = torch.nn.parallel.DistributedDataParallel(
+                    self._network,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=True,
+                )
+        elif len(self._multiple_gpus) > 1:
+            if not hasattr(self._network, "module"):
+                self._network = nn.DataParallel(self._network, self._multiple_gpus)
 
         self._train(self.train_loader, self.test_loader)
         #这里的样本是怎么选的还没看------------------------------------------
-        self.build_rehearsal_memory(data_manager, self.samples_per_class)
-
-        if len(self._multiple_gpus) > 1:
+        if hasattr(self._network, "module"):
+            self.build_rehearsal_memory(data_manager, self.samples_per_class)
             self._network = self._network.module
+        else:
+            self.build_rehearsal_memory(data_manager, self.samples_per_class)
 
     def train(self):
         self._network.train()
-        if len(self._multiple_gpus) > 1 :
+        if hasattr(self._network, "module"):
             self._network_module_ptr = self._network.module
         else:
             self._network_module_ptr = self._network
@@ -149,7 +196,7 @@ class TagFex(BaseLearner):
                 optimizer=optimizer, milestones=milestones, gamma=lrate_decay
             )
             self._update_representation(train_loader, test_loader, optimizer, scheduler)
-            if len(self._multiple_gpus) > 1:
+            if hasattr(self._network, "module"):
                 self._network.module.weight_align(
                     self._total_classes - self._known_classes
                 )
@@ -175,6 +222,9 @@ class TagFex(BaseLearner):
         prog_bar = tqdm(range(init_epoch), disable=disable_tqdm, dynamic_ncols=True)
 
         for _, epoch in enumerate(prog_bar):
+            if train_loader.sampler is not None:
+                if isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                    train_loader.sampler.set_epoch(epoch)
             self.train()
             losses = 0.0
             correct, total = 0, 0
@@ -266,6 +316,9 @@ class TagFex(BaseLearner):
         task_prefix = f"task_{self._cur_task}"
         freeze_ta_losses = self.args.get("freeze_ta_after_task0", False) and self._cur_task > 0
         for _, epoch in enumerate(prog_bar):
+            if train_loader.sampler is not None:
+                if isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                    train_loader.sampler.set_epoch(epoch)
             self.train()
             losses = 0.0
             losses_clf = 0.0

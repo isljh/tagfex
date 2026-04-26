@@ -1,5 +1,5 @@
 {
-    "prefix": "reproduce",
+    "prefix": "tagfex_1gpu",
     "dataset": "imagenet100_aa",
     "memory_size": 2000,
     "memory_per_class": 20,
@@ -7,7 +7,7 @@
     "shuffle": true,
     "init_cls": 10,
     "increment": 10,
-    "model_name": "tagfex_ta_detach",
+    "model_name": "tagfex",
     "convnet_type": "resnet18",
     "device": ["0"],
     "seed": [1993],
@@ -25,7 +25,7 @@
     "aux_factor":2,
     "contrast_kd_factor":2,
     "aug":2,
-    "num_views": 8,
+    "num_views": 2,
     "lejepa_lambda": 0.05,
     "is_distributed": false
 }

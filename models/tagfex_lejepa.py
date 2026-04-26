@@ -28,7 +28,7 @@ epochs = 170
 update_lr = 5e-4
 #milestones = [80, 120, 150]
 #lrate_decay = 0.1
-batch_size = 128
+batch_size = 64
 weight_decay = 5e-4
 num_workers = 16
 T = 2
@@ -37,7 +37,7 @@ T = 2
 class SIGReg(nn.Module):
 
 
-    def __init__(self, knots=17):
+    def __init__(self, knots=17, matrix_mode="per_batch_random"):
         super().__init__()
         # 初始化积分节点和权重，用于改进的积分近似
         # 1. 在 [0, 3] 之间切 17 个等距离的点,t就是采样点的位置
@@ -50,13 +50,39 @@ class SIGReg(nn.Module):
         self.register_buffer("t", t)
         self.register_buffer("phi", window)  # 目标高斯分布的特征函数
         self.register_buffer("weights", weights * window)
+        self.matrix_mode = matrix_mode
+        self.fixed_A = None
+        self.running_A = None
+        self.running_count = 0
+
+    def _sample_matrix(self, feat_dim, device):
+        A = torch.randn(feat_dim, 256, device=device)
+        return A.div_(A.norm(p=2, dim=0, keepdim=True).clamp_min(EPSILON))
+
+    def _normalize_columns(self, A):
+        return A / A.norm(p=2, dim=0, keepdim=True).clamp_min(EPSILON)
 
     def forward(self, proj):
         device = proj.device
-        # proj(Projected Embeddings投影后的特征向量): [Views, Batch, Dim] 或者是拼接后的特征 [N, Dim][128,1024]
-        # 1. 随机投影到一个子空间（Sketched）
-        A = torch.randn(proj.size(-1), 256, device=device)  # [1024, 256]
-        A = A.div_(A.norm(p=2, dim=0))
+        feat_dim = proj.size(-1)
+        if self.matrix_mode == "per_batch_random":
+            A = self._sample_matrix(feat_dim, device)
+        elif self.matrix_mode == "fixed":
+            if self.fixed_A is None or self.fixed_A.shape[0] != feat_dim or self.fixed_A.device != device:
+                self.fixed_A = self._sample_matrix(feat_dim, device)
+            A = self.fixed_A
+        elif self.matrix_mode == "running_avg":
+            A_new = self._sample_matrix(feat_dim, device)
+            if self.running_A is None or self.running_A.shape[0] != feat_dim or self.running_A.device != device:
+                self.running_A = A_new
+                self.running_count = 1
+            else:
+                self.running_A = (self.running_count * self.running_A + A_new) / (self.running_count + 1)
+                self.running_A = self._normalize_columns(self.running_A)
+                self.running_count += 1
+            A = self.running_A
+        else:
+            raise ValueError("Unknown sigreg_matrix_mode: {}".format(self.matrix_mode))
 
         t = self.t.to(device)
         phi = self.phi.to(device)
@@ -86,7 +112,10 @@ class TagFex(BaseLearner):
         }
         """
         # --- 实例化 SIGReg ---
-        self.sig_reg = SIGReg(knots=17)
+        self.sig_reg = SIGReg(
+            knots=17,
+            matrix_mode=self.args.get("sigreg_matrix_mode", "per_batch_random"),
+        )
 
         # --- SwanLab 初始化 ---
         local_rank = self.args.get("local_rank", 0)
@@ -349,6 +378,7 @@ class TagFex(BaseLearner):
 
         V_dim = self.args.get('num_views', 8)
         lamb = self.args.get('lejepa_lambda', 0.05)
+        kd_global_only = self.args.get("kd_global_only", False)
 
         task_prefix = f"Task_{self._cur_task}"
         batch_step = 0
@@ -386,23 +416,18 @@ class TagFex(BaseLearner):
                 loss_aux = F.cross_entropy(aux_logits, aux_targets)
 
                 # Distill Loss
-                predicted_feature = outputs['predicted_feature'] # [N*V, Dim]
-                """
-                with torch.no_grad():
-                    old_ta_feature = self.last_ta_net(vs.flatten(0, 1))['features']
-                kd_loss = infoNCE_distill_loss(self.last_projector(predicted_feature),
-                                               self.last_projector(old_ta_feature), self.args['infonce_kd_temp'])
-                """
-                # 找到这一行并确保投影层的一致性
+                predicted_feature = outputs['predicted_feature']  # [N*V, Dim]
                 with torch.no_grad():
                     old_out = self.last_ta_net(vs.flatten(0, 1))
                     old_ta_feature = old_out['features']
-                    # 建议：如果 last_projector 也是旧的，确保它是 frozen 状态
-                    z_target = self.last_projector(old_ta_feature)
 
+                if kd_global_only:
+                    # LeJEPA 仍使用全部 8 个视图进行自监督；仅将 KD 约束限制在前两个 global views。
+                    predicted_feature = predicted_feature.reshape(N, V_dim, -1)[:, :2, :].reshape(N * 2, -1)
+                    old_ta_feature = old_ta_feature.reshape(N, V_dim, -1)[:, :2, :].reshape(N * 2, -1)
+
+                z_target = self.last_projector(old_ta_feature)
                 p_pred = self.last_projector(predicted_feature)
-
-                # 调用修正后的函数
                 kd_loss = infoNCE_distill_loss(p_pred, z_target, self.args['infonce_kd_temp'])
 
                 # Transfer Loss
