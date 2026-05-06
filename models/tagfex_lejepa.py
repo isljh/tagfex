@@ -54,13 +54,57 @@ class SIGReg(nn.Module):
         self.fixed_A = None
         self.running_A = None
         self.running_count = 0
+        self.matrix_seed = None
+        self.matrix_generator = None
+
+    def set_matrix_seed(self, seed):
+        self.matrix_seed = int(seed)
+        self.matrix_generator = torch.Generator()
+        self.matrix_generator.manual_seed(self.matrix_seed)
+
+    def reset_running_state(self):
+        self.running_A = None
+        self.running_count = 0
 
     def _sample_matrix(self, feat_dim, device):
-        A = torch.randn(feat_dim, 256, device=device)
+        if self.matrix_generator is None:
+            A = torch.randn(feat_dim, 256, device=device)
+        else:
+            A = torch.randn(feat_dim, 256, generator=self.matrix_generator, dtype=torch.float32).to(device)
         return A.div_(A.norm(p=2, dim=0, keepdim=True).clamp_min(EPSILON))
 
     def _normalize_columns(self, A):
         return A / A.norm(p=2, dim=0, keepdim=True).clamp_min(EPSILON)
+
+    def get_matrix_state(self):
+        return {
+            "matrix_mode": self.matrix_mode,
+            "fixed_A": self.fixed_A.detach().cpu() if self.fixed_A is not None else None,
+            "running_A": self.running_A.detach().cpu() if self.running_A is not None else None,
+            "running_count": self.running_count,
+            "matrix_seed": self.matrix_seed,
+        }
+
+    def load_matrix_state(self, state, device=None):
+        if not state:
+            return False
+
+        saved_mode = state.get("matrix_mode")
+        if saved_mode is not None and saved_mode != self.matrix_mode:
+            logging.warning(
+                "Skip loading SIGReg matrix state because checkpoint mode {} != current mode {}.".format(
+                    saved_mode, self.matrix_mode
+                )
+            )
+            return False
+
+        device = device or self.t.device
+        fixed_A = state.get("fixed_A")
+        running_A = state.get("running_A")
+        self.fixed_A = fixed_A.to(device) if isinstance(fixed_A, torch.Tensor) else None
+        self.running_A = running_A.to(device) if isinstance(running_A, torch.Tensor) else None
+        self.running_count = int(state.get("running_count", 0))
+        return True
 
     def forward(self, proj):
         device = proj.device
@@ -116,6 +160,7 @@ class TagFex(BaseLearner):
             knots=17,
             matrix_mode=self.args.get("sigreg_matrix_mode", "per_batch_random"),
         )
+        self._sigreg_task_matrix_states = {}
 
         # --- SwanLab 初始化 ---
         local_rank = self.args.get("local_rank", 0)
@@ -128,6 +173,59 @@ class TagFex(BaseLearner):
                 suffix="timestamp"  # 防止重名
             )
         # ---------------------
+
+    def _sigreg_matrix_seed_for_task(self, task_id):
+        base_seed = int(self.args.get("sigreg_matrix_seed", self.args.get("seed", 0)))
+        if self.sig_reg.matrix_mode == "fixed":
+            return base_seed
+        return base_seed + int(task_id) * 1000003
+
+    def _prepare_sigreg_for_task(self, local_rank=0):
+        matrix_seed = self._sigreg_matrix_seed_for_task(self._cur_task)
+        self.sig_reg.set_matrix_seed(matrix_seed)
+        if self.sig_reg.matrix_mode == "running_avg":
+            self.sig_reg.reset_running_state()
+            if local_rank <= 0:
+                logging.info(
+                    "SIGReg running_avg matrix reset for task {} with seed {}.".format(
+                        self._cur_task, matrix_seed
+                    )
+                )
+
+    def _record_sigreg_task_state(self, state):
+        if state.get("matrix_mode") != "running_avg" or state.get("running_A") is None:
+            return
+
+        task_id = int(state.get("task_id", self._cur_task))
+        self._sigreg_task_matrix_states[str(task_id)] = {
+            "matrix_mode": state["matrix_mode"],
+            "task_id": task_id,
+            "running_A": state["running_A"],
+            "running_count": state["running_count"],
+            "matrix_seed": state.get("matrix_seed"),
+        }
+
+    def get_sigreg_state(self):
+        current_state = self.sig_reg.get_matrix_state()
+        current_state["task_id"] = self._cur_task
+        self._record_sigreg_task_state(current_state)
+
+        return {
+            "current": current_state,
+            "task_matrix_states": self._sigreg_task_matrix_states,
+        }
+
+    def load_sigreg_state(self, state):
+        if not state:
+            return False
+
+        if "current" in state:
+            self._sigreg_task_matrix_states = state.get("task_matrix_states", {})
+            state = state["current"]
+
+        state.setdefault("task_id", self._cur_task)
+        self._record_sigreg_task_state(state)
+        return self.sig_reg.load_matrix_state(state, self._device)
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -150,6 +248,7 @@ class TagFex(BaseLearner):
 
         local_rank = self.args.get("local_rank", 0)
         is_distributed = self.args.get("is_distributed", False)
+        self._prepare_sigreg_for_task(local_rank)
 
         # --- 新增：自动计算每个 GPU 的 batch_size ---
         if is_distributed:

@@ -242,6 +242,7 @@ def _save_resume_checkpoint(model, save_path, task, history_state=None):
         "data_memory": model._data_memory,
         "targets_memory": model._targets_memory,
         "class_means": getattr(model, "_class_means", None),
+        "sigreg_state": model.get_sigreg_state() if hasattr(model, "get_sigreg_state") else None,
         "cnn_curve": history_state.get("cnn_curve", {"top1": [], "top5": []}),
         "nme_curve": history_state.get("nme_curve", {"top1": [], "top5": []}),
         "cnn_matrix": history_state.get("cnn_matrix", []),
@@ -271,6 +272,14 @@ def _resume_from_checkpoint(model, data_manager, resume_path):
     class_means = ckpt.get("class_means", None)
     if class_means is not None:
         model._class_means = class_means
+
+    sigreg_state = ckpt.get("sigreg_state", None)
+    if hasattr(model, "load_sigreg_state"):
+        if sigreg_state is not None:
+            if model.load_sigreg_state(sigreg_state):
+                logging.info("Loaded SIGReg matrix state from checkpoint.")
+        else:
+            logging.warning("Checkpoint does not contain SIGReg matrix state; SIGReg matrix will be reinitialized.")
 
     model.after_task()
     history_state = {
