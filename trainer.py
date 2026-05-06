@@ -26,9 +26,7 @@ def _train(args):
     local_rank = args.get("local_rank", 0)
 
     init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
-    log_root = "logs/{}/{}/{}/{}".format(
-        args["prefix"], args["dataset"], init_cls, args["increment"]
-    )
+    log_root = _build_log_root(args, init_cls)
     resume_path = _resolve_resume_path(args, log_root)
 
     # 1. 只有主进程创建文件夹
@@ -37,7 +35,7 @@ def _train(args):
         logs_name = os.path.dirname(os.path.dirname(resume_path))
         timestamp = os.path.basename(logs_name)
     else:
-        logs_name = "logs/{}/{}/{}/{}/{}".format(args["prefix"], args["dataset"], init_cls, args['increment'], timestamp)
+        logs_name = os.path.join(log_root, timestamp)
     if local_rank <= 0:
         if not os.path.exists(logs_name):
             os.makedirs(logs_name)
@@ -219,6 +217,17 @@ def print_args(args):
             "Running in debug mode with uncommitted changes. "
             "This run is not a clean, fully reproducible experiment snapshot."
         )
+
+
+def _build_log_root(args, init_cls):
+    base_log_dir = args.get("log_root", "logs")
+    return os.path.join(
+        base_log_dir,
+        args["prefix"],
+        args["dataset"],
+        str(init_cls),
+        str(args["increment"]),
+    )
 
 
 def _save_resume_checkpoint(model, save_path, task, history_state=None):

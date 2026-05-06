@@ -158,8 +158,12 @@ class iImageNet100(iData):
 
     def download_data(self):
         #assert 0, "You should specify the folder of your dataset"
+        """在实验室3090上的配置
         train_dir = "/media/DATASET/person_data/ImageNet100/train/"
         test_dir = "/media/DATASET/person_data/ImageNet100/val/"
+        """
+        train_dir = "/root/autodl-tmp/datasets/ImageNet100/train/"
+        test_dir = "/root/autodl-tmp/datasets/ImageNet100/val/"
         #train_dir = "E:/continual-learning/datasets/ImageNet100/train"
         #test_dir = "E:/continual-learning/datasets/ImageNet100/val"
 

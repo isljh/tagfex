@@ -8,6 +8,7 @@
     "init_cls": 10,
     "increment": 10,
     "model_name": "tagfex_lejepa",
+    "log_root": "/root/autodl-tmp/tagfex_logs",
     "convnet_type": "resnet18",
     "device": ["0"],
     "seed": [1993],
@@ -27,7 +28,7 @@
     "aug": 1,
     "num_views": 8,
     "lejepa_lambda": 0.05,
-    "is_distributed": true,
+    "is_distributed": false,
     "fusion_type": "mean",
     "kd_global_only": true,
     "sigreg_matrix_mode": "fixed"

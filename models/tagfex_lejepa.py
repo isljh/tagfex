@@ -384,7 +384,7 @@ class TagFex(BaseLearner):
         batch_step = 0
 
         for _, epoch in enumerate(prog_bar):
-            if train_loader.sampler is not None:
+            if isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
                 train_loader.sampler.set_epoch(epoch)
 
             self.train()
