@@ -79,6 +79,43 @@ def accuracy(y_pred, y_true, nb_old, increment=10):
     return all_acc
 
 
+def accuracy_by_groups(y_pred, y_true, nb_old, group_sizes):
+    assert len(y_pred) == len(y_true), "Data length error."
+    all_acc = {}
+    all_acc["total"] = np.around(
+        (y_pred == y_true).sum() * 100 / len(y_true), decimals=2
+    )
+
+    starts = np.cumsum([0] + list(group_sizes[:-1])).astype(int).tolist()
+    for low, size in zip(starts, group_sizes):
+        high = low + int(size)
+        idxes = np.where(np.logical_and(y_true >= low, y_true < high))[0]
+        if len(idxes) == 0:
+            continue
+        label = "{}-{}".format(str(low).rjust(2, "0"), str(high - 1).rjust(2, "0"))
+        all_acc[label] = np.around(
+            (y_pred[idxes] == y_true[idxes]).sum() * 100 / len(idxes), decimals=2
+        )
+
+    idxes = np.where(y_true < nb_old)[0]
+    all_acc["old"] = (
+        0
+        if len(idxes) == 0
+        else np.around(
+            (y_pred[idxes] == y_true[idxes]).sum() * 100 / len(idxes), decimals=2
+        )
+    )
+    idxes = np.where(y_true >= nb_old)[0]
+    all_acc["new"] = (
+        0
+        if len(idxes) == 0
+        else np.around(
+            (y_pred[idxes] == y_true[idxes]).sum() * 100 / len(idxes), decimals=2
+        )
+    )
+    return all_acc
+
+
 def split_images_labels(imgs):
     # split trainset.imgs in ImageFolder
     images = []

@@ -29,7 +29,21 @@ def main():
     args_dict = vars(args)
 
     # 2. 合并参数
-    for key in ['dataset', 'init_cls', 'increment', 'run_mode']:
+    for key in [
+        'dataset',
+        'init_cls',
+        'increment',
+        'run_mode',
+        'seed',
+        'rnd_seed',
+        'setting',
+        'data_protocol',
+        'si_blurry',
+        'n_tasks',
+        'n',
+        'm',
+        'rnd_NM',
+    ]:
         if args_dict.get(key) is not None:
             param[key] = args_dict[key]
 
@@ -72,6 +86,15 @@ def setup_parser():
     parser.add_argument('--dataset', type=str)
     parser.add_argument('--init_cls', type=int)
     parser.add_argument('--increment', type=int)
+    parser.add_argument('--seed', type=int, nargs='+')
+    parser.add_argument('--rnd_seed', type=int)
+    parser.add_argument('--setting', type=str)
+    parser.add_argument('--data_protocol', type=str)
+    parser.add_argument('--si_blurry', action='store_true', default=None)
+    parser.add_argument('--n_tasks', type=int)
+    parser.add_argument('--n', type=int)
+    parser.add_argument('--m', type=int)
+    parser.add_argument('--rnd_NM', action='store_true', default=None)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--resume_dir', type=str, default=None)
     parser.add_argument('--auto_resume', action='store_true')

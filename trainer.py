@@ -24,8 +24,11 @@ def _train(args):
     # 获取分布式信息
     is_distributed = args.get("is_distributed", False)
     local_rank = args.get("local_rank", 0)
+    args.pop("task_increments", None)
 
-    init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
+    init_cls_arg = args.get("init_cls", args.get("increment", 0))
+    increment_arg = args.get("increment", init_cls_arg)
+    init_cls = 0 if init_cls_arg == increment_arg else init_cls_arg
     log_root = _build_log_root(args, init_cls)
     resume_path = _resolve_resume_path(args, log_root)
 
@@ -74,10 +77,12 @@ def _train(args):
         args["dataset"],
         args["shuffle"],
         args["seed"],
-        args["init_cls"],
-        args["increment"],
+        init_cls_arg,
+        increment_arg,
         args["aug"] if "aug" in args else 1,
+        args=args,
     )
+    args["task_increments"] = data_manager.get_task_sizes()
     model = factory.get_model(args["model_name"], args)
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
@@ -96,6 +101,7 @@ def _train(args):
 
     # 6. 开始任务循环
     for task in range(start_task, data_manager.nb_tasks):
+        data_manager.set_current_task(task)
         if local_rank <= 0:
             logging.info("All params: {}".format(count_parameters(model._network)))
             logging.info("Trainable params: {}".format(count_parameters(model._network, True)))
@@ -221,6 +227,19 @@ def print_args(args):
 
 def _build_log_root(args, init_cls):
     base_log_dir = args.get("log_root", "logs")
+    setting = str(args.get("setting") or args.get("data_protocol") or "").lower()
+    if args.get("si_blurry", False) or setting in {"si_blurry", "flygcl"}:
+        return os.path.join(
+            base_log_dir,
+            args["prefix"],
+            args["dataset"],
+            "si_blurry",
+            "tasks{}_n{}_m{}".format(
+                args.get("n_tasks", 5),
+                args.get("n", 50),
+                args.get("m", 10),
+            ),
+        )
     return os.path.join(
         base_log_dir,
         args["prefix"],

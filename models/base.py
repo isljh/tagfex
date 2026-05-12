@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from utils.toolkit import tensor2numpy, accuracy
+from utils.toolkit import tensor2numpy, accuracy, accuracy_by_groups
 from scipy.spatial.distance import cdist
 import os
 
@@ -68,7 +68,11 @@ class BaseLearner(object):
 
     def _evaluate(self, y_pred, y_true):
         ret = {}
-        grouped = accuracy(y_pred.T[0], y_true, self._known_classes)
+        task_increments = self.args.get("task_increments")
+        if task_increments is None:
+            grouped = accuracy(y_pred.T[0], y_true, self._known_classes)
+        else:
+            grouped = accuracy_by_groups(y_pred.T[0], y_true, self._known_classes, task_increments)
         ret["grouped"] = grouped
         ret["top1"] = grouped["total"]
         ret["top{}".format(self.topk)] = np.around(
