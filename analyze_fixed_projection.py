@@ -3,6 +3,8 @@ import csv
 import json
 import math
 import os
+import shlex
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,19 +18,38 @@ from utils.inc_net import TagFexNet
 EPSILON = 1e-8
 DEFAULT_HIST_DIRECTIONS = "0,1,2,3,4,5,10,20"
 DEFAULT_CONFIG = "exps/tagfex_lejepa_mean_fusion_imagenet100_fixed_matrix.json"
+DEFAULT_OUTPUT_DIR = "outputs/fixed_projection_analysis"
+DEFAULT_NUM_DIRECTIONS = 256
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Analyze LeJEPA fixed random projection matrix Gaussianity."
     )
-    parser.add_argument("--ckpt", required=True, help="Path to a resumable task checkpoint.")
+    parser.add_argument(
+        "--ckpt",
+        default=None,
+        help=(
+            "Path to a resumable task checkpoint. If omitted, resolves the newest "
+            "matching checkpoint from --config log_root/prefix/dataset/init_cls/increment."
+        ),
+    )
     parser.add_argument(
         "--a-fixed",
         default=None,
         help="Path to A_fixed.pth. If omitted, tries to read sigreg_state.current.fixed_A from --ckpt.",
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="Experiment JSON used to build the model/data.")
+    parser.add_argument(
+        "--log-root",
+        default=None,
+        help="Override config log_root when auto-resolving --ckpt.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Specific run timestamp to use when auto-resolving --ckpt, e.g. 20260429_155855.",
+    )
     parser.add_argument("--task-id", type=int, default=0, help="Task id to analyze.")
     parser.add_argument(
         "--ckpt-task-id",
@@ -37,7 +58,11 @@ def parse_args():
         help="Task id represented by a raw state_dict checkpoint without a 'task' field.",
     )
     parser.add_argument("--data-root", default=None, help="Dataset root, e.g. path/to/ImageNet100.")
-    parser.add_argument("--output-dir", required=True, help="Directory for JSON/CSV/figures.")
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for JSON/CSV/figures.",
+    )
     parser.add_argument("--device", default=None, help="cpu, cuda, cuda:0, or a GPU index.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -48,6 +73,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None, help="Override the seed in --config.")
     parser.add_argument("--hist-directions", default=DEFAULT_HIST_DIRECTIONS)
     parser.add_argument("--projection-chunk-size", type=int, default=16384)
+    parser.add_argument("--num-projection-directions", type=int, default=DEFAULT_NUM_DIRECTIONS)
     parser.add_argument(
         "--max-features",
         type=int,
@@ -99,25 +125,68 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def first_seed(config, seed_override=None):
+    if seed_override is not None:
+        return int(seed_override)
+    seed_value = config.get("seed", 0)
+    if isinstance(seed_value, list):
+        if not seed_value:
+            raise ValueError("Config seed list is empty.")
+        seed_value = seed_value[0]
+    return int(seed_value)
+
+
 def normalize_columns(matrix):
     return matrix / matrix.norm(p=2, dim=0, keepdim=True).clamp_min(EPSILON)
 
 
 def configure_args(config, device, seed_override=None):
     config = dict(config)
-    seed_value = config.get("seed", 0)
-    if isinstance(seed_value, list):
-        seed_value = seed_value[0]
-    if seed_override is not None:
-        seed_value = seed_override
-
-    config["seed"] = int(seed_value)
+    config["seed"] = first_seed(config, seed_override)
     config["device"] = [device]
     config["is_distributed"] = False
     config["local_rank"] = 0
     config.setdefault("aug", 1)
     config.setdefault("run_mode", "debug")
     return config
+
+
+def init_log_dir_name(config):
+    init_cls = int(config["init_cls"])
+    increment = int(config["increment"])
+    return "0" if init_cls == increment else str(init_cls)
+
+
+def checkpoint_name(config, task_id):
+    return "{}_{}_task_{}.pth".format(config["prefix"], config["seed"], task_id)
+
+
+def resolve_checkpoint_path(config, args):
+    if args.ckpt:
+        return Path(args.ckpt)
+
+    log_root = Path(args.log_root or config.get("log_root", "logs"))
+    run_root = (
+        log_root
+        / config["prefix"]
+        / config["dataset"]
+        / init_log_dir_name(config)
+        / str(config["increment"])
+    )
+    ckpt_filename = checkpoint_name(config, args.task_id)
+
+    if args.run_id:
+        candidates = [run_root / args.run_id / "checkpoints" / ckpt_filename]
+    else:
+        candidates = sorted(run_root.glob(f"*/checkpoints/{ckpt_filename}"))
+
+    existing = [path for path in candidates if path.is_file()]
+    if not existing:
+        pattern = run_root / (args.run_id or "*") / "checkpoints" / ckpt_filename
+        raise FileNotFoundError(
+            "Could not auto-resolve --ckpt. Looked for: {}".format(pattern)
+        )
+    return existing[-1]
 
 
 def build_data_manager(config, data_root):
@@ -215,7 +284,8 @@ def find_matrix(obj, preferred_keys):
     return None
 
 
-def reconstruct_fixed_matrix(config, feat_dim=1024, num_directions=256):
+def reconstruct_fixed_matrix(config, feat_dim=None, num_directions=DEFAULT_NUM_DIRECTIONS):
+    feat_dim = int(feat_dim or config.get("proj_output_dim", 1024))
     seed = int(config.get("sigreg_matrix_seed", config.get("seed", 0)))
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
@@ -230,25 +300,30 @@ def load_fixed_matrix(a_fixed_path, ckpt_obj, config):
         matrix = find_matrix(obj, preferred_keys)
         if matrix is None:
             raise ValueError(f"Could not find a 2D fixed matrix in {a_fixed_path}")
-        return matrix.float()
+        return matrix.float(), f"file:{a_fixed_path}"
 
     matrix = find_matrix(ckpt_obj, preferred_keys)
     if matrix is None:
         if config.get("sigreg_matrix_mode") == "fixed":
+            seed = int(config.get("sigreg_matrix_seed", config.get("seed", 0)))
             print(
                 "[warn] Could not find A_fixed in --ckpt; reconstructing fixed matrix "
                 "from sigreg_matrix_seed/seed."
             )
-            return reconstruct_fixed_matrix(config)
+            matrix = reconstruct_fixed_matrix(config)
+            return matrix, f"reconstructed:sigreg_matrix_seed={seed}"
         raise ValueError("Could not find A_fixed in --ckpt; pass --a-fixed explicitly.")
-    return matrix.float()
+    return matrix.float(), "checkpoint:sigreg_state.current.fixed_A"
 
 
-def validate_projection_setup(projector_dim, A_fixed):
-    if projector_dim != 1024:
-        raise ValueError(f"Expected projector output dim 1024, got {projector_dim}.")
-    if tuple(A_fixed.shape) != (1024, 256):
-        raise ValueError(f"Expected A_fixed shape [1024, 256], got {list(A_fixed.shape)}.")
+def validate_projection_setup(projector_dim, A_fixed, expected_projector_dim, expected_num_directions):
+    if projector_dim != expected_projector_dim:
+        raise ValueError(
+            f"Expected projector output dim {expected_projector_dim}, got {projector_dim}."
+        )
+    expected_shape = (expected_projector_dim, expected_num_directions)
+    if tuple(A_fixed.shape) != expected_shape:
+        raise ValueError(f"Expected A_fixed shape {list(expected_shape)}, got {list(A_fixed.shape)}.")
 
 
 def unpack_batch(batch):
@@ -640,8 +715,9 @@ def main():
     device = parse_device(args.device)
     config = configure_args(load_json(args.config), device, args.seed)
     set_seed(config["seed"])
+    ckpt_path = resolve_checkpoint_path(config, args)
 
-    ckpt_obj = torch_load(args.ckpt, map_location="cpu")
+    ckpt_obj = torch_load(ckpt_path, map_location="cpu")
     state_dict, checkpoint_task_id = checkpoint_state_and_task(ckpt_obj, args.ckpt_task_id)
 
     data_manager = build_data_manager(config, args.data_root)
@@ -656,14 +732,19 @@ def main():
     )
     model = build_model(config, data_manager, checkpoint_task_id, state_dict, device)
 
-    A_fixed = load_fixed_matrix(args.a_fixed, ckpt_obj, config)
+    A_fixed, matrix_source = load_fixed_matrix(args.a_fixed, ckpt_obj, config)
     A_fixed = normalize_columns(A_fixed)
 
     all_proj, all_labels, batch_proj, batch_labels = collect_projector_outputs(
         model, loader, device, max_features=args.max_features
     )
     projector_dim = int(all_proj.size(1))
-    validate_projection_setup(projector_dim, A_fixed)
+    validate_projection_setup(
+        projector_dim,
+        A_fixed,
+        int(config.get("proj_output_dim", projector_dim)),
+        args.num_projection_directions,
+    )
 
     hist_directions = parse_hist_directions(args.hist_directions)
     plt = None if args.skip_figures else get_pyplot()
@@ -681,7 +762,7 @@ def main():
     random_stats = []
     first_random_z = None
     for eval_id in range(args.num_random_eval):
-        A_random = generate_random_matrix(projector_dim, 256, args.random_seed + eval_id)
+        A_random = generate_random_matrix(projector_dim, A_fixed.size(1), args.random_seed + eval_id)
         z_random = project_in_chunks(all_proj, A_random, device, args.projection_chunk_size)
         stats = compute_direction_stats(z_random)
         add_sigreg(stats, z_random, args.skip_sigreg_loss, args.projection_chunk_size)
@@ -708,9 +789,11 @@ def main():
     dump_json(
         {
             "metadata": {
-                "checkpoint": args.ckpt,
-                "a_fixed": args.a_fixed or "checkpoint:sigreg_state.current.fixed_A",
+                "checkpoint": str(ckpt_path),
+                "a_fixed": args.a_fixed,
+                "matrix_source": matrix_source,
                 "config": args.config,
+                "command": " ".join(shlex.quote(item) for item in sys.argv),
                 "task_id": args.task_id,
                 "checkpoint_task_id": checkpoint_task_id,
                 "source": args.source,
@@ -736,6 +819,8 @@ def main():
         plot_pca(all_proj, all_labels, fig_dir, args.max_pca_points, config["seed"], plt)
 
     print(f"Collected projector features: {list(all_proj.shape)}")
+    print(f"Checkpoint: {ckpt_path}")
+    print(f"Fixed matrix source: {matrix_source}")
     print(f"Batch fixed summary: {batch_fixed_stats['summary']}")
     print(f"Task fixed summary: {task_fixed_stats['summary']}")
     print(f"Random multi-eval summary: {multi_summary}")
