@@ -815,6 +815,9 @@ class TagFexNet(nn.Module):
 
     #权重对齐
     def weight_align(self, increment):
+        if increment <= 0:
+            logging.info("Skip weight alignment because increment is {}.".format(increment))
+            return
         weights = self.fc.weight.data
         newnorm = torch.norm(weights[-increment:, :], p=2, dim=1)
         oldnorm = torch.norm(weights[:-increment, :], p=2, dim=1)

@@ -80,7 +80,7 @@ class DataManager(object):
             raise ValueError("Unknown mode {}.".format(mode))
 
         data, targets = [], []
-        if self.use_si_blurry and source == "train" and self._use_current_session(indices, ret_data):
+        if self.use_si_blurry and source == "train" and self._use_current_session(indices, ret_data, mode):
             session_data, session_targets = self._get_si_blurry_session_data()
             data.append(session_data)
             targets.append(session_targets)
@@ -324,6 +324,10 @@ class DataManager(object):
         self._si_blurry_new_classes = [
             [old_to_new[c] for c in task_classes] for task_classes in new_classes_by_task
         ]
+        self._si_blurry_disjoint_classes = [
+            sorted([old_to_new[c] for c in task_classes])
+            for task_classes in self.train_sampler.disjoint_classes
+        ]
         self._si_blurry_session_classes = [
             sorted([old_to_new[c] for c in task_classes])
             for task_classes in session_classes_by_task
@@ -357,10 +361,18 @@ class DataManager(object):
                 )
             )
 
-    def _use_current_session(self, indices, ret_data):
+    def get_si_blurry_eval_groups(self):
+        if not self.use_si_blurry:
+            return None
+        return {
+            "disjoint": [list(task_classes) for task_classes in self._si_blurry_disjoint_classes],
+            "session": [list(task_classes) for task_classes in self._si_blurry_session_classes],
+        }
+
+    def _use_current_session(self, indices, ret_data, mode):
         if self._current_task is None or ret_data:
             return False
-        return len(indices) > 0
+        return len(indices) > 0 or mode == "train"
 
     def _get_si_blurry_session_data(self):
         task_indices = self._si_blurry_task_indices[self._current_task]

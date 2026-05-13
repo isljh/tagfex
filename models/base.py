@@ -11,6 +11,16 @@ import os
 EPSILON = 1e-8
 batch_size = 64
 
+
+def _accuracy_for_class_set(y_pred, y_true, class_set):
+    if len(class_set) == 0:
+        return 0
+    idxes = np.where(np.isin(y_true, list(class_set)))[0]
+    if len(idxes) == 0:
+        return 0
+    return np.around((y_pred[idxes] == y_true[idxes]).sum() * 100 / len(idxes), decimals=2)
+
+
 class BaseLearner(object):
     def __init__(self, args):
         self.args = args
@@ -73,6 +83,7 @@ class BaseLearner(object):
             grouped = accuracy(y_pred.T[0], y_true, self._known_classes)
         else:
             grouped = accuracy_by_groups(y_pred.T[0], y_true, self._known_classes, task_increments)
+        self._add_si_blurry_accuracy(grouped, y_pred.T[0], y_true)
         ret["grouped"] = grouped
         ret["top1"] = grouped["total"]
         ret["top{}".format(self.topk)] = np.around(
@@ -80,6 +91,41 @@ class BaseLearner(object):
             decimals=2,
         )
         return ret
+
+    def _add_si_blurry_accuracy(self, grouped, y_pred, y_true):
+        si_blurry_groups = self.args.get("si_blurry_eval_groups")
+        if not si_blurry_groups:
+            return
+
+        session_by_task = si_blurry_groups.get("session", [])
+        disjoint_by_task = si_blurry_groups.get("disjoint", [])
+        if len(session_by_task) == 0 or self._cur_task < 0:
+            return
+
+        upto_task = min(self._cur_task, len(session_by_task) - 1)
+        exposed_classes = set()
+        for task_classes in session_by_task[: upto_task + 1]:
+            exposed_classes.update(int(class_idx) for class_idx in task_classes)
+        exposed_classes = {
+            class_idx for class_idx in exposed_classes if class_idx < self._total_classes
+        }
+
+        disjoint_classes = set()
+        for task_classes in disjoint_by_task[: upto_task + 1]:
+            disjoint_classes.update(int(class_idx) for class_idx in task_classes)
+        disjoint_classes = {
+            class_idx
+            for class_idx in disjoint_classes
+            if class_idx in exposed_classes and class_idx < self._total_classes
+        }
+        blurry_classes = exposed_classes - disjoint_classes
+
+        grouped["disjoint_only"] = _accuracy_for_class_set(
+            y_pred, y_true, disjoint_classes
+        )
+        grouped["blurry_exposed"] = _accuracy_for_class_set(
+            y_pred, y_true, blurry_classes
+        )
 
     def eval_task(self, save_conf=False):
         y_pred, y_true = self._eval_cnn(self.test_loader)
@@ -184,6 +230,13 @@ class BaseLearner(object):
             mask = np.where(dummy_targets == class_idx)[0]
             #直接保留旧 memory 里前 m 个
             dd, dt = dummy_data[mask][:m], dummy_targets[mask][:m]
+            if len(dd) == 0:
+                logging.warning(
+                    "No stored exemplars for class {} when reducing memory; skipping.".format(
+                        class_idx
+                    )
+                )
+                continue
             self._data_memory = np.concatenate((self._data_memory, dd)) if len(self._data_memory) != 0 else dd
             self._targets_memory = np.concatenate((self._targets_memory, dt)) if len(self._targets_memory) != 0 else dt
 
@@ -202,6 +255,13 @@ class BaseLearner(object):
         #task1之后，选取[10,11,12,...,19]
         for class_idx in range(self._known_classes, self._total_classes):
             data, targets, idx_dataset = data_manager.get_dataset(np.arange(class_idx, class_idx + 1), source="train", mode="test", ret_data=True)
+            if len(data) == 0:
+                logging.warning(
+                    "No available training samples for class {} when constructing exemplars; skipping.".format(
+                        class_idx
+                    )
+                )
+                continue
             idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
             #vectors:[所有样本数量，拼接起来的特征维度]  (N，feature_dim)
             vectors, _ = self._extract_vectors(idx_loader)
@@ -211,7 +271,15 @@ class BaseLearner(object):
             class_mean = np.mean(vectors, axis=0)
 
             selected_exemplars, exemplar_vectors = [], []
-            for k in range(1, m + 1):
+            available = len(data)
+            select_count = min(m, available)
+            if select_count < m:
+                logging.warning(
+                    "Class {} only has {} available samples; storing {} exemplars instead of {}.".format(
+                        class_idx, available, select_count, m
+                    )
+                )
+            for k in range(1, select_count + 1):
                 S = np.sum(exemplar_vectors, axis=0) if len(exemplar_vectors) > 0 else 0
                 mu_p = (vectors + S) / k
                 i = np.argmin(np.sqrt(np.sum((class_mean - mu_p) ** 2, axis=1)))
@@ -222,7 +290,7 @@ class BaseLearner(object):
 
             #当前这个“类”刚选出来的 m 个样本
             selected_exemplars = np.array(selected_exemplars)
-            exemplar_targets = np.full(m, class_idx)
+            exemplar_targets = np.full(select_count, class_idx)
             #所有“历史类”累计的 exemplar
             self._data_memory = np.concatenate((self._data_memory, selected_exemplars)) if len(self._data_memory) != 0 else selected_exemplars
             self._targets_memory = np.concatenate((self._targets_memory, exemplar_targets)) if len(self._targets_memory) != 0 else exemplar_targets
@@ -242,6 +310,13 @@ class BaseLearner(object):
         for class_idx in range(self._known_classes):
             mask = np.where(self._targets_memory == class_idx)[0]
             class_data, class_targets = self._data_memory[mask], self._targets_memory[mask]
+            if len(class_data) == 0:
+                logging.warning(
+                    "No stored exemplars for class {} when updating unified means; skipping.".format(
+                        class_idx
+                    )
+                )
+                continue
             class_dset = data_manager.get_dataset([], source="train", mode="test", appendent=(class_data, class_targets))
             class_loader = DataLoader(class_dset, batch_size=batch_size, shuffle=False, num_workers=4)
             vectors, _ = self._extract_vectors(class_loader)
@@ -252,13 +327,28 @@ class BaseLearner(object):
 
         for class_idx in range(self._known_classes, self._total_classes):
             data, targets, class_dset = data_manager.get_dataset(np.arange(class_idx, class_idx + 1), source="train", mode="test", ret_data=True)
+            if len(data) == 0:
+                logging.warning(
+                    "No available training samples for class {} when constructing exemplars; skipping.".format(
+                        class_idx
+                    )
+                )
+                continue
             class_loader = DataLoader(class_dset, batch_size=batch_size, shuffle=False, num_workers=4)
             vectors, _ = self._extract_vectors(class_loader)
             vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
             class_mean = np.mean(vectors, axis=0)
 
             selected_exemplars, exemplar_vectors = [], []
-            for k in range(1, m + 1):
+            available = len(data)
+            select_count = min(m, available)
+            if select_count < m:
+                logging.warning(
+                    "Class {} only has {} available samples; storing {} exemplars instead of {}.".format(
+                        class_idx, available, select_count, m
+                    )
+                )
+            for k in range(1, select_count + 1):
                 S = np.sum(exemplar_vectors, axis=0) if len(exemplar_vectors) > 0 else 0
                 mu_p = (vectors + S) / k
                 i = np.argmin(np.sqrt(np.sum((class_mean - mu_p) ** 2, axis=1)))
@@ -268,7 +358,7 @@ class BaseLearner(object):
                 data = np.delete(data, i, axis=0)
 
             selected_exemplars = np.array(selected_exemplars)
-            exemplar_targets = np.full(m, class_idx)
+            exemplar_targets = np.full(select_count, class_idx)
             self._data_memory = np.concatenate((self._data_memory, selected_exemplars)) if len(self._data_memory) != 0 else selected_exemplars
             self._targets_memory = np.concatenate((self._targets_memory, exemplar_targets)) if len(self._targets_memory) != 0 else exemplar_targets
 

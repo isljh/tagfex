@@ -74,7 +74,7 @@ class SiBlurrySampler:
         disjoint_flat = class_order[: self.disjoint_num]
         blurry_flat = class_order[self.disjoint_num : self.disjoint_num + self.blurry_num]
 
-        self.disjoint_classes = self._random_chunks(disjoint_flat)
+        self.disjoint_classes = self._random_chunks(disjoint_flat, require_non_empty=True)
         self.blurry_classes = self._random_chunks(blurry_flat)
         self._build_indices(equal_blur_split=False)
 
@@ -91,9 +91,32 @@ class SiBlurrySampler:
         width = len(values) // self.num_tasks
         return [values[i * width : (i + 1) * width] for i in range(self.num_tasks)]
 
-    def _random_chunks(self, values):
+    def _random_chunks(self, values, require_non_empty=False):
         if len(values) == 0:
             return [[] for _ in range(self.num_tasks)]
+        if require_non_empty:
+            if len(values) < self.num_tasks:
+                raise ValueError(
+                    "Cannot assign at least one class to each task: "
+                    "{} classes, {} tasks.".format(len(values), self.num_tasks)
+                )
+            sizes = [1 for _ in range(self.num_tasks)]
+            remaining = len(values) - self.num_tasks
+            if remaining > 0:
+                assignments = torch.randint(
+                    0,
+                    self.num_tasks,
+                    (remaining,),
+                    generator=self.generator,
+                ).tolist()
+                for task_id in assignments:
+                    sizes[task_id] += 1
+            chunks = []
+            offset = 0
+            for size in sizes:
+                chunks.append(values[offset : offset + size])
+                offset += size
+            return chunks
         cuts = self._random_cut_points(len(values))
         return [values[cuts[i] : cuts[i + 1]] for i in range(self.num_tasks)]
 

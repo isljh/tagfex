@@ -25,6 +25,7 @@ def _train(args):
     is_distributed = args.get("is_distributed", False)
     local_rank = args.get("local_rank", 0)
     args.pop("task_increments", None)
+    args.pop("si_blurry_eval_groups", None)
 
     init_cls_arg = args.get("init_cls", args.get("increment", 0))
     increment_arg = args.get("increment", init_cls_arg)
@@ -83,6 +84,9 @@ def _train(args):
         args=args,
     )
     args["task_increments"] = data_manager.get_task_sizes()
+    si_blurry_eval_groups = data_manager.get_si_blurry_eval_groups()
+    if si_blurry_eval_groups is not None:
+        args["si_blurry_eval_groups"] = si_blurry_eval_groups
     model = factory.get_model(args["model_name"], args)
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}

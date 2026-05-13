@@ -196,12 +196,12 @@ class TagFex(BaseLearner):
                 optimizer=optimizer, milestones=milestones, gamma=lrate_decay
             )
             self._update_representation(train_loader, test_loader, optimizer, scheduler)
-            if hasattr(self._network, "module"):
-                self._network.module.weight_align(
-                    self._total_classes - self._known_classes
-                )
-            else:
-                self._network.weight_align(self._total_classes - self._known_classes)
+            new_task_size = self._total_classes - self._known_classes
+            if new_task_size > 0:
+                if hasattr(self._network, "module"):
+                    self._network.module.weight_align(new_task_size)
+                else:
+                    self._network.weight_align(new_task_size)
 
     def _compute_accuracy(self, model, loader):
         model.eval()
@@ -360,12 +360,16 @@ class TagFex(BaseLearner):
                 trans_logits = outputs["trans_logits"]
                 #把batch中的新类样本挑出来
                 cur_task_mask = (targets >= self._known_classes)
-                trans_cls_loss = F.cross_entropy(trans_logits[cur_task_mask], targets[cur_task_mask] - self._known_classes)
-                #判断要不要进行迁移，左侧分类损失和右侧分类损失对比·
-                if trans_cls_loss < loss_clf:
-                    T = self.args['kd_temp']
-                    transfer_loss = F.kl_div((logits[cur_task_mask][:, self._known_classes:] / T).log_softmax(dim=1), (trans_logits.detach()[cur_task_mask] / T).softmax(dim=1), reduction='batchmean')
+                if cur_task_mask.any():
+                    trans_cls_loss = F.cross_entropy(trans_logits[cur_task_mask], targets[cur_task_mask] - self._known_classes)
+                    #判断要不要进行迁移，左侧分类损失和右侧分类损失对比·
+                    if trans_cls_loss < loss_clf:
+                        T = self.args['kd_temp']
+                        transfer_loss = F.kl_div((logits[cur_task_mask][:, self._known_classes:] / T).log_softmax(dim=1), (trans_logits.detach()[cur_task_mask] / T).softmax(dim=1), reduction='batchmean')
+                    else:
+                        transfer_loss = torch.tensor(0., device=self._device)
                 else:
+                    trans_cls_loss = torch.tensor(0., device=self._device)
                     transfer_loss = torch.tensor(0., device=self._device)
 
                 auto_kd_factor = self._known_classes / self._total_classes
