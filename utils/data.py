@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 from torchvision import datasets, transforms
@@ -5,6 +6,28 @@ from utils.toolkit import split_images_labels
 from . import autoaugment
 from . import ops
 from .autoaugment import ImageNetPolicy
+
+
+def _get_data_root(default_root="./data"):
+    return os.environ.get("TAGFEX_DATA_ROOT", default_root)
+
+
+def _get_imagenet100_dirs():
+    data_root = os.environ.get("TAGFEX_DATA_ROOT")
+    if data_root:
+        train_dir = os.path.join(data_root, "train")
+        val_dir = os.path.join(data_root, "val")
+        test_dir = os.path.join(data_root, "test")
+        if os.path.isdir(train_dir) and os.path.isdir(val_dir):
+            return train_dir, val_dir
+        if os.path.isdir(train_dir) and os.path.isdir(test_dir):
+            return train_dir, test_dir
+        return train_dir, val_dir
+
+    train_dir = "/root/autodl-tmp/datasets/ImageNet100/train/"
+    test_dir = "/root/autodl-tmp/datasets/ImageNet100/val/"
+    return train_dir, test_dir
+
 
 class iData(object):
     train_trsf = []
@@ -31,8 +54,9 @@ class iCIFAR10(iData):
     class_order = np.arange(10).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR10("./data", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR10("./data", train=False, download=True)
+        data_root = _get_data_root()
+        train_dataset = datasets.cifar.CIFAR10(data_root, train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR10(data_root, train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
@@ -59,8 +83,9 @@ class iCIFAR100(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100("./data", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100("./data", train=False, download=True)
+        data_root = _get_data_root()
+        train_dataset = datasets.cifar.CIFAR100(data_root, train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR100(data_root, train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
@@ -162,8 +187,7 @@ class iImageNet100(iData):
         train_dir = "/media/DATASET/person_data/ImageNet100/train/"
         test_dir = "/media/DATASET/person_data/ImageNet100/val/"
         """
-        train_dir = "/root/autodl-tmp/datasets/ImageNet100/train/"
-        test_dir = "/root/autodl-tmp/datasets/ImageNet100/val/"
+        train_dir, test_dir = _get_imagenet100_dirs()
         #train_dir = "E:/continual-learning/datasets/ImageNet100/train"
         #test_dir = "E:/continual-learning/datasets/ImageNet100/val"
 

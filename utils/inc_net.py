@@ -6,7 +6,10 @@ from torch import nn
 from convs.cifar_resnet import resnet32
 from convs.resnet import resnet18, resnet34, resnet50, resnet101, resnet152
 from convs.linears import SimpleLinear, SplitCosineLinear, CosineLinear, TagFex_SimpleLinear
-from torchvision.ops import MLP
+try:
+    from torchvision.ops import MLP
+except ImportError:
+    MLP = None
 
 
 def get_convnet(args, pretrained=False):
