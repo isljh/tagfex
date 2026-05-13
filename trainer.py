@@ -1,4 +1,6 @@
 import sys
+import csv
+import json
 import logging
 import copy
 import torch
@@ -102,6 +104,71 @@ def _train(args):
 
         # 增量训练
         model.incremental_train(data_manager)
+
+        ckpt_dir = os.path.join(logs_name, "checkpoints")
+        if local_rank <= 0 and not os.path.exists(ckpt_dir):
+            os.makedirs(ckpt_dir)
+
+        if hasattr(model, "has_pending_final_sigreg") and model.has_pending_final_sigreg():
+            history_state = _make_history_state(cnn_curve, nme_curve, cnn_matrix, nme_matrix)
+            final_artifact_dir = os.path.join(logs_name, "final_sigreg")
+
+            before_cnn_accy = None
+            if local_rank <= 0:
+                before_cnn_accy = _eval_cnn_only(model)
+                logging.info("Final SIGReg before CNN: {}".format(before_cnn_accy["grouped"]))
+                before_path = os.path.join(
+                    ckpt_dir,
+                    "{}_{}_task_{}_before_final_sigreg.pth".format(
+                        args["prefix"], args["seed"], task
+                    ),
+                )
+                _save_resume_checkpoint(
+                    model,
+                    before_path,
+                    task,
+                    history_state,
+                    extra_state={"final_sigreg_stage": "before"},
+                )
+                logging.info("!!! Before final SIGReg checkpoint saved to: {} !!!".format(before_path))
+
+            final_state = model.run_final_sigreg_calibration(
+                data_manager,
+                final_artifact_dir,
+                ckpt_dir=ckpt_dir,
+            )
+
+            after_cnn_accy = None
+            if local_rank <= 0:
+                after_cnn_accy = _eval_cnn_only(model)
+                logging.info("Final SIGReg after CNN: {}".format(after_cnn_accy["grouped"]))
+                after_path = os.path.join(
+                    ckpt_dir,
+                    "{}_{}_task_{}_after_final_sigreg.pth".format(
+                        args["prefix"], args["seed"], task
+                    ),
+                )
+                _save_resume_checkpoint(
+                    model,
+                    after_path,
+                    task,
+                    history_state,
+                    extra_state={
+                        "final_sigreg_stage": "after",
+                        "final_sigreg_state": final_state,
+                    },
+                )
+                logging.info("!!! After final SIGReg checkpoint saved to: {} !!!".format(after_path))
+                _save_final_sigreg_accuracy(
+                    final_artifact_dir,
+                    task,
+                    before_cnn_accy,
+                    after_cnn_accy,
+                    final_state,
+                )
+
+            model.complete_incremental_train(data_manager)
+
         #accy是字典
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
@@ -144,7 +211,6 @@ def _train(args):
                 logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
                 logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"]) / len(cnn_curve["top1"])))
 
-            ckpt_dir = os.path.join(logs_name, "checkpoints")
             if not os.path.exists(ckpt_dir):
                 os.makedirs(ckpt_dir)
 
@@ -152,12 +218,7 @@ def _train(args):
                 args["prefix"], args["seed"], task
             ))
 
-            history_state = {
-                "cnn_curve": cnn_curve,
-                "nme_curve": nme_curve,
-                "cnn_matrix": cnn_matrix,
-                "nme_matrix": nme_matrix,
-            }
+            history_state = _make_history_state(cnn_curve, nme_curve, cnn_matrix, nme_matrix)
             _save_resume_checkpoint(model, save_path, task, history_state)
             logging.info("!!! Model checkpoint saved to: {} !!!".format(save_path))
 
@@ -230,9 +291,21 @@ def _build_log_root(args, init_cls):
     )
 
 
-def _save_resume_checkpoint(model, save_path, task, history_state=None):
+def _make_history_state(cnn_curve, nme_curve, cnn_matrix, nme_matrix):
+    return {
+        "cnn_curve": cnn_curve,
+        "nme_curve": nme_curve,
+        "cnn_matrix": cnn_matrix,
+        "nme_matrix": nme_matrix,
+    }
+
+
+def _save_resume_checkpoint(model, save_path, task, history_state=None, extra_state=None):
     network = model._network.module if hasattr(model._network, "module") else model._network
     history_state = history_state or {}
+    final_sigreg_state = (
+        model.get_final_sigreg_state() if hasattr(model, "get_final_sigreg_state") else None
+    )
     ckpt = {
         "task": task,
         "cur_task": model._cur_task,
@@ -243,12 +316,92 @@ def _save_resume_checkpoint(model, save_path, task, history_state=None):
         "targets_memory": model._targets_memory,
         "class_means": getattr(model, "_class_means", None),
         "sigreg_state": model.get_sigreg_state() if hasattr(model, "get_sigreg_state") else None,
+        "final_sigreg_state": final_sigreg_state,
         "cnn_curve": history_state.get("cnn_curve", {"top1": [], "top5": []}),
         "nme_curve": history_state.get("nme_curve", {"top1": [], "top5": []}),
         "cnn_matrix": history_state.get("cnn_matrix", []),
         "nme_matrix": history_state.get("nme_matrix", []),
     }
+    if extra_state:
+        ckpt.update(extra_state)
     torch.save(ckpt, save_path)
+
+
+def _eval_cnn_only(model):
+    y_pred, y_true = model._eval_cnn(model.test_loader)
+    return model._evaluate(y_pred, y_true)
+
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _accuracy_row(stage, accy):
+    row = {
+        "stage": stage,
+        "top1": accy.get("top1"),
+        "top5": accy.get("top5"),
+    }
+    for key, value in accy.get("grouped", {}).items():
+        safe_key = str(key).replace("-", "_")
+        row[f"group_{safe_key}"] = value
+    return row
+
+
+def _delta_row(before_row, after_row):
+    row = {"stage": "delta_after_minus_before"}
+    for key, before_value in before_row.items():
+        if key == "stage":
+            continue
+        after_value = after_row.get(key)
+        if isinstance(before_value, (int, float, np.number)) and isinstance(
+            after_value, (int, float, np.number)
+        ):
+            row[key] = float(after_value) - float(before_value)
+    return row
+
+
+def _save_final_sigreg_accuracy(artifact_dir, task, before_cnn_accy, after_cnn_accy, final_state):
+    os.makedirs(artifact_dir, exist_ok=True)
+    before_row = _accuracy_row("before_final_sigreg", before_cnn_accy)
+    after_row = _accuracy_row("after_final_sigreg", after_cnn_accy)
+    delta_row = _delta_row(before_row, after_row)
+    rows = [before_row, after_row, delta_row]
+
+    csv_path = os.path.join(artifact_dir, "final_sigreg_task_{}_accuracy.csv".format(task))
+    fieldnames = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    json_path = os.path.join(artifact_dir, "final_sigreg_task_{}_accuracy.json".format(task))
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            _json_ready(
+                {
+                    "task_id": task,
+                    "before_cnn": before_cnn_accy,
+                    "after_cnn": after_cnn_accy,
+                    "delta_after_minus_before": delta_row,
+                    "final_sigreg_state": final_state,
+                }
+            ),
+            f,
+            indent=2,
+        )
 
 
 def _resume_from_checkpoint(model, data_manager, resume_path):
@@ -330,7 +483,9 @@ def _find_latest_checkpoint_in_dir(run_dir):
     ckpt_files = [
         os.path.join(ckpt_dir, f)
         for f in os.listdir(ckpt_dir)
-        if f.endswith(".pth") and "_task_" in f
+        if f.endswith(".pth")
+        and "_task_" in f
+        and f.rsplit("_task_", 1)[-1].split(".pth")[0].isdigit()
     ]
     if len(ckpt_files) == 0:
         raise FileNotFoundError("No task checkpoints found under {}".format(ckpt_dir))

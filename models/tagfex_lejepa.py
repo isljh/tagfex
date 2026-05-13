@@ -1,5 +1,7 @@
 # Please note that only "cifar100_aa" and "cifar10_aa" are supported for TagFex in PyCIL_DDP.
+import csv
 import logging
+import os
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -161,6 +163,8 @@ class TagFex(BaseLearner):
             matrix_mode=self.args.get("sigreg_matrix_mode", "per_batch_random"),
         )
         self._sigreg_task_matrix_states = {}
+        self._pending_rehearsal_memory_build = False
+        self._final_sigreg_last_state = None
 
         # --- SwanLab 初始化 ---
         local_rank = self.args.get("local_rank", 0)
@@ -316,13 +320,24 @@ class TagFex(BaseLearner):
 
         self._train(self.train_loader, self.test_loader)
 
-        # --- 关键修改：Task 结束后的处理 ---
-        # 无论 DDP 还是 DP，在构建 memory 前保持包装，build 完后统一解包
+        if self.args.get("final_sigreg", False):
+            if hasattr(self._network, "module"):
+                self._network = self._network.module
+            self._pending_rehearsal_memory_build = True
+            return
+
+        self.complete_incremental_train(data_manager)
+
+    def has_pending_final_sigreg(self):
+        return bool(self.args.get("final_sigreg", False) and self._pending_rehearsal_memory_build)
+
+    def complete_incremental_train(self, data_manager):
         if hasattr(self._network, 'module'):
             self.build_rehearsal_memory(data_manager, self.samples_per_class)
             self._network = self._network.module  # 解包，回到 TagFexNet 原始类
         else:
             self.build_rehearsal_memory(data_manager, self.samples_per_class)
+        self._pending_rehearsal_memory_build = False
 
     def train(self):
         self._network.train()
@@ -619,6 +634,253 @@ class TagFex(BaseLearner):
             correct += (predicts.cpu() == targets).sum()
             total += len(targets)
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+    def _final_sigreg_seed_for_task(self):
+        base_seed = int(self.args.get("final_sigreg_matrix_seed", self.args.get("seed", 0)))
+        return base_seed + int(self._cur_task) * 1000003
+
+    def _make_final_sigreg_matrix(self, feat_dim, num_directions):
+        generator = torch.Generator(device="cpu")
+        seed = self._final_sigreg_seed_for_task()
+        generator.manual_seed(seed)
+        matrix = torch.randn(feat_dim, num_directions, generator=generator, dtype=torch.float32)
+        matrix = matrix / matrix.norm(p=2, dim=0, keepdim=True).clamp_min(EPSILON)
+        return matrix, seed
+
+    def _sigreg_loss_with_matrix(self, proj, matrix):
+        matrix = matrix.to(proj.device)
+        t = self.sig_reg.t.to(proj.device)
+        phi = self.sig_reg.phi.to(proj.device)
+        weights = self.sig_reg.weights.to(proj.device)
+        x_t = (proj @ matrix).unsqueeze(-1) * t
+        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ weights) * proj.size(-2)
+        return statistic.mean()
+
+    def _final_sigreg_embedding(self, ptr, inputs):
+        ta_out = ptr._get_active_ta_model()(inputs)
+        ta_fmap = ta_out["fmaps"][-1]
+        ta_feature = ta_fmap.flatten(2).permute(0, 2, 1).mean(1)
+        return ptr.projector(ta_feature)
+
+    def _set_final_sigreg_update_scope(self):
+        ptr = self._network.module if hasattr(self._network, "module") else self._network
+        requires_grad_state = {
+            name: param.requires_grad for name, param in ptr.named_parameters()
+        }
+        for param in ptr.parameters():
+            param.requires_grad_(False)
+
+        ta_model = ptr._get_active_ta_model()
+        for param in ta_model.parameters():
+            param.requires_grad_(True)
+        for param in ptr.projector.parameters():
+            param.requires_grad_(True)
+
+        trainable_params = [
+            param for param in list(ta_model.parameters()) + list(ptr.projector.parameters())
+            if param.requires_grad
+        ]
+        return ptr, requires_grad_state, trainable_params
+
+    def _restore_requires_grad(self, ptr, requires_grad_state):
+        for name, param in ptr.named_parameters():
+            if name in requires_grad_state:
+                param.requires_grad_(requires_grad_state[name])
+
+    def run_final_sigreg_calibration(self, data_manager, artifact_dir, ckpt_dir=None):
+        if not self.args.get("final_sigreg", False):
+            return None
+
+        local_rank = self.args.get("local_rank", 0)
+        artifact_dir = artifact_dir or "."
+        os.makedirs(artifact_dir, exist_ok=True)
+        if ckpt_dir is not None:
+            os.makedirs(ckpt_dir, exist_ok=True)
+
+        ptr, requires_grad_state, trainable_params = self._set_final_sigreg_update_scope()
+        if not trainable_params:
+            raise RuntimeError("Final SIGReg has no trainable TA/projector parameters.")
+
+        ptr.to(self._device)
+        self.sig_reg.to(self._device)
+        ptr.train()
+        for convnet in ptr.convnets:
+            convnet.eval()
+        if ptr.fc is not None:
+            ptr.fc.eval()
+        if ptr.aux_fc is not None:
+            ptr.aux_fc.eval()
+        if ptr.trans_classifier is not None:
+            ptr.trans_classifier.eval()
+        if ptr.predictor is not None:
+            ptr.predictor.eval()
+        ptr._get_active_ta_model().train()
+        ptr.projector.train()
+
+        batch_size_final = int(self.args.get("final_sigreg_batch_size", batch_size))
+        num_workers_final = int(self.args.get("final_sigreg_num_workers", num_workers))
+        epochs_final = int(self.args.get("final_sigreg_epochs", 1))
+        lr_final = float(self.args.get("final_sigreg_lr", 5e-5))
+        weight_decay_final = float(self.args.get("final_sigreg_weight_decay", weight_decay))
+        loss_factor = float(self.args.get("final_sigreg_factor", 1.0))
+        num_directions = int(self.args.get("final_sigreg_num_directions", 256))
+        V_dim = int(self.args.get("num_views", 8))
+
+        final_dataset = data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="train",
+            mode="train",
+            appendent=None,
+        )
+        final_loader = DataLoader(
+            final_dataset,
+            batch_size=batch_size_final,
+            shuffle=True,
+            num_workers=num_workers_final,
+            pin_memory=self._device.type == "cuda",
+            drop_last=False,
+        )
+
+        feat_dim = int(self.args.get("proj_output_dim", 1024))
+        A_final, matrix_seed = self._make_final_sigreg_matrix(feat_dim, num_directions)
+        a_final_path = None
+        if ckpt_dir is not None and local_rank <= 0:
+            a_final_path = os.path.join(
+                ckpt_dir,
+                "{}_{}_task_{}_final_sigreg_A_final.pth".format(
+                    self.args["prefix"], self.args["seed"], self._cur_task
+                ),
+            )
+            torch.save(
+                {
+                    "task_id": self._cur_task,
+                    "matrix_mode": "final_fixed",
+                    "A_final": A_final,
+                    "projection_matrix": A_final,
+                    "matrix_seed": matrix_seed,
+                    "num_directions": num_directions,
+                    "feat_dim": feat_dim,
+                },
+                a_final_path,
+            )
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=lr_final,
+            weight_decay=weight_decay_final,
+        )
+
+        loss_rows = []
+        global_step = 0
+        for epoch in range(epochs_final):
+            epoch_loss, epoch_samples = 0.0, 0
+            for batch_idx, data in enumerate(final_loader):
+                vs = data[1].to(self._device, non_blocking=True)
+                if vs.ndim == 5:
+                    n = vs.shape[0]
+                    inputs = vs.flatten(0, 1)
+                    num_samples = n * vs.shape[1]
+                elif vs.ndim == 4:
+                    inputs = vs
+                    n = max(1, vs.shape[0] // V_dim)
+                    num_samples = vs.shape[0]
+                else:
+                    raise ValueError("Unexpected final SIGReg input shape: {}".format(list(vs.shape)))
+
+                embedding = self._final_sigreg_embedding(ptr, inputs)
+                sigreg_loss = self._sigreg_loss_with_matrix(embedding, A_final)
+                loss = sigreg_loss * loss_factor
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                loss_value = float(loss.detach().cpu())
+                sigreg_value = float(sigreg_loss.detach().cpu())
+                epoch_loss += loss_value
+                epoch_samples += num_samples
+                row = {
+                    "task_id": self._cur_task,
+                    "epoch": epoch,
+                    "iter": batch_idx,
+                    "global_step": global_step,
+                    "loss": loss_value,
+                    "sigreg_loss": sigreg_value,
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "batch_samples": int(num_samples),
+                    "batch_items": int(n),
+                }
+                loss_rows.append(row)
+
+                if local_rank <= 0:
+                    swanlab.log(
+                        {
+                            f"Task_{self._cur_task}/final_sigreg_loss": loss_value,
+                            f"Task_{self._cur_task}/final_sigreg_raw": sigreg_value,
+                        }
+                    )
+                global_step += 1
+
+            if local_rank <= 0:
+                logging.info(
+                    "Final SIGReg task {} epoch {}/{} loss {:.6f}.".format(
+                        self._cur_task,
+                        epoch + 1,
+                        epochs_final,
+                        epoch_loss / max(1, len(final_loader)),
+                    )
+                )
+
+        loss_csv_path = os.path.join(
+            artifact_dir,
+            "final_sigreg_task_{}_loss.csv".format(self._cur_task),
+        )
+        if local_rank <= 0:
+            with open(loss_csv_path, "w", encoding="utf-8", newline="") as f:
+                fieldnames = [
+                    "task_id",
+                    "epoch",
+                    "iter",
+                    "global_step",
+                    "loss",
+                    "sigreg_loss",
+                    "lr",
+                    "batch_samples",
+                    "batch_items",
+                ]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(loss_rows)
+
+        self._restore_requires_grad(ptr, requires_grad_state)
+        ptr.eval()
+
+        final_state = {
+            "enabled": True,
+            "task_id": self._cur_task,
+            "epochs": epochs_final,
+            "lr": lr_final,
+            "weight_decay": weight_decay_final,
+            "loss_factor": loss_factor,
+            "batch_size": batch_size_final,
+            "num_workers": num_workers_final,
+            "matrix_mode": "final_fixed",
+            "update_scope": "ta_projector",
+            "matrix_seed": matrix_seed,
+            "num_directions": num_directions,
+            "feat_dim": feat_dim,
+            "A_final_path": a_final_path,
+            "loss_csv_path": loss_csv_path if local_rank <= 0 else None,
+            "num_loss_rows": len(loss_rows),
+            "final_loss": loss_rows[-1]["loss"] if loss_rows else None,
+            "avg_loss": float(np.mean([row["loss"] for row in loss_rows])) if loss_rows else None,
+        }
+        self._final_sigreg_last_state = final_state
+        return final_state
+
+    def get_final_sigreg_state(self):
+        return self._final_sigreg_last_state
 
 
 def infoNCE_loss(feats, t):
