@@ -14,19 +14,28 @@ def _get_data_root(default_root="./data"):
 
 def _get_imagenet100_dirs():
     data_root = os.environ.get("TAGFEX_DATA_ROOT")
+    candidate_roots = []
     if data_root:
-        train_dir = os.path.join(data_root, "train")
-        val_dir = os.path.join(data_root, "val")
-        test_dir = os.path.join(data_root, "test")
+        candidate_roots.append(data_root)
+    candidate_roots.extend(
+        [
+            "/root/autodl-tmp/ImageNet100",
+            "/root/autodl-tmp/datasets/ImageNet100",
+            "/media/DATASET/person_data/ImageNet100",
+        ]
+    )
+
+    for root in candidate_roots:
+        train_dir = os.path.join(root, "train")
+        val_dir = os.path.join(root, "val")
+        test_dir = os.path.join(root, "test")
         if os.path.isdir(train_dir) and os.path.isdir(val_dir):
             return train_dir, val_dir
         if os.path.isdir(train_dir) and os.path.isdir(test_dir):
             return train_dir, test_dir
-        return train_dir, val_dir
 
-    train_dir = "/root/autodl-tmp/datasets/ImageNet100/train/"
-    test_dir = "/root/autodl-tmp/datasets/ImageNet100/val/"
-    return train_dir, test_dir
+    root = data_root or candidate_roots[0]
+    return os.path.join(root, "train"), os.path.join(root, "val")
 
 
 class iData(object):

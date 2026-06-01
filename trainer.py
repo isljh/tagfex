@@ -3,13 +3,18 @@ import csv
 import json
 import logging
 import copy
+import random
 import torch
+from torch.utils.data import DataLoader
+import swanlab
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
 import os
 import numpy as np
 import time
+
+EPSILON = 1e-8
 
 
 def train(args):
@@ -41,6 +46,8 @@ def _train(args):
     if local_rank <= 0:
         if not os.path.exists(logs_name):
             os.makedirs(logs_name)
+    args["logs_name"] = logs_name
+    args["diagnostics_dir"] = os.path.join(logs_name, "diagnostics")
 
     logfilename = os.path.join(
         logs_name,
@@ -80,6 +87,11 @@ def _train(args):
         args["increment"],
         args["aug"] if "aug" in args else 1,
     )
+    args["class_order"] = list(getattr(data_manager, "_class_order", []))
+    args["task_increments"] = list(getattr(data_manager, "_increments", []))
+    if local_rank <= 0:
+        _save_run_reproducibility(args, logs_name)
+
     model = factory.get_model(args["model_name"], args)
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
@@ -114,9 +126,45 @@ def _train(args):
             final_artifact_dir = os.path.join(logs_name, "final_sigreg")
 
             before_cnn_accy = None
+            before_nme_accy = None
             if local_rank <= 0:
-                before_cnn_accy = _eval_cnn_only(model)
+                before_cnn_accy, before_cnn_pred, before_cnn_true = _eval_cnn_outputs(model)
                 logging.info("Final SIGReg before CNN: {}".format(before_cnn_accy["grouped"]))
+                if args.get("record_final_sigreg_nme", False):
+                    (
+                        before_nme_accy,
+                        before_nme_pred,
+                        before_nme_true,
+                        _,
+                    ) = _eval_nme_with_fresh_class_means(model, data_manager)
+                    logging.info(
+                        "Final SIGReg before NME (analysis class means): {}".format(
+                            before_nme_accy["grouped"]
+                        )
+                    )
+
+                if args.get("record_confusion_matrix", False):
+                    final_conf_dir = os.path.join(final_artifact_dir, "confusion_matrices")
+                    _save_confusion_artifacts(
+                        final_conf_dir,
+                        task,
+                        "before_final_sigreg",
+                        "CNN",
+                        before_cnn_pred,
+                        before_cnn_true,
+                        model._total_classes,
+                    )
+                    if before_nme_accy is not None:
+                        _save_confusion_artifacts(
+                            final_conf_dir,
+                            task,
+                            "before_final_sigreg",
+                            "NME_analysis",
+                            before_nme_pred,
+                            before_nme_true,
+                            model._total_classes,
+                        )
+
                 before_path = os.path.join(
                     ckpt_dir,
                     "{}_{}_task_{}_before_final_sigreg.pth".format(
@@ -139,9 +187,45 @@ def _train(args):
             )
 
             after_cnn_accy = None
+            after_nme_accy = None
             if local_rank <= 0:
-                after_cnn_accy = _eval_cnn_only(model)
+                after_cnn_accy, after_cnn_pred, after_cnn_true = _eval_cnn_outputs(model)
                 logging.info("Final SIGReg after CNN: {}".format(after_cnn_accy["grouped"]))
+                if args.get("record_final_sigreg_nme", False):
+                    (
+                        after_nme_accy,
+                        after_nme_pred,
+                        after_nme_true,
+                        _,
+                    ) = _eval_nme_with_fresh_class_means(model, data_manager)
+                    logging.info(
+                        "Final SIGReg after NME (analysis class means): {}".format(
+                            after_nme_accy["grouped"]
+                        )
+                    )
+
+                if args.get("record_confusion_matrix", False):
+                    final_conf_dir = os.path.join(final_artifact_dir, "confusion_matrices")
+                    _save_confusion_artifacts(
+                        final_conf_dir,
+                        task,
+                        "after_final_sigreg",
+                        "CNN",
+                        after_cnn_pred,
+                        after_cnn_true,
+                        model._total_classes,
+                    )
+                    if after_nme_accy is not None:
+                        _save_confusion_artifacts(
+                            final_conf_dir,
+                            task,
+                            "after_final_sigreg",
+                            "NME_analysis",
+                            after_nme_pred,
+                            after_nme_true,
+                            model._total_classes,
+                        )
+
                 after_path = os.path.join(
                     ckpt_dir,
                     "{}_{}_task_{}_after_final_sigreg.pth".format(
@@ -164,6 +248,8 @@ def _train(args):
                     task,
                     before_cnn_accy,
                     after_cnn_accy,
+                    before_nme_accy,
+                    after_nme_accy,
                     final_state,
                 )
 
@@ -171,6 +257,13 @@ def _train(args):
 
         #accy是字典
         cnn_accy, nme_accy = model.eval_task()
+        if local_rank <= 0 and args.get("record_confusion_matrix", False):
+            _save_model_confusions(
+                model,
+                os.path.join(args["diagnostics_dir"], "confusion_matrices"),
+                task,
+                "official_after_task",
+            )
         model.after_task()
 
         # 只有主进程收集并打印当前任务的结果
@@ -210,6 +303,21 @@ def _train(args):
                 cnn_curve["top5"].append(cnn_accy["top5"])
                 logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
                 logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"]) / len(cnn_curve["top1"])))
+
+            summary_payload = _task_summary_payload(
+                "CNN",
+                cnn_accy,
+                include_old=model._known_classes > 0,
+            )
+            summary_payload.update(
+                _task_summary_payload(
+                    "NME",
+                    nme_accy,
+                    include_old=model._known_classes > 0,
+                )
+            )
+            if summary_payload:
+                swanlab.log(summary_payload, step=task)
 
             if not os.path.exists(ckpt_dir):
                 os.makedirs(ckpt_dir)
@@ -259,6 +367,8 @@ def _set_device(args):
 
 
 def _set_random(seed=1):
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -300,6 +410,95 @@ def _make_history_state(cnn_curve, nme_curve, cnn_matrix, nme_matrix):
     }
 
 
+def _task_summary_payload(method, accy, include_old=True):
+    if accy is None:
+        return {}
+
+    grouped = accy.get("grouped", {})
+    payload = {
+        f"Summary/{method}_total_acc": accy.get("top1"),
+        f"Summary/{method}_new_acc": grouped.get("new"),
+        f"Summary/{method}_top5": accy.get("top5"),
+    }
+    if include_old:
+        payload[f"Summary/{method}_old_acc"] = grouped.get("old")
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _runtime_reproducibility_metadata(args):
+    return {
+        "python_version": sys.version,
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "cudnn_version": torch.backends.cudnn.version(),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "tagfex_data_root": os.environ.get("TAGFEX_DATA_ROOT"),
+        "local_rank": args.get("local_rank"),
+        "is_distributed": args.get("is_distributed"),
+        "run_mode": args.get("run_mode"),
+        "config_path": args.get("config_path"),
+        "run_command": args.get("run_command"),
+        "git_branch": args.get("git_branch"),
+        "git_commit": args.get("git_commit"),
+        "git_dirty": args.get("git_dirty"),
+    }
+
+
+def _save_run_reproducibility(args, logs_name):
+    os.makedirs(logs_name, exist_ok=True)
+    resolved_config_path = os.path.join(logs_name, "resolved_config.json")
+    run_metadata_path = os.path.join(logs_name, "run_reproducibility.json")
+    args["resolved_config_path"] = resolved_config_path
+    args["run_metadata_path"] = run_metadata_path
+
+    with open(resolved_config_path, "w", encoding="utf-8") as f:
+        json.dump(_json_ready(args), f, indent=2, ensure_ascii=False)
+
+    with open(run_metadata_path, "w", encoding="utf-8") as f:
+        json.dump(
+            _json_ready(
+                {
+                    "args": args,
+                    "runtime": _runtime_reproducibility_metadata(args),
+                    "checkpoint_note": "Task checkpoints include model weights, replay memory, class means, SIGReg/final-SIGReg states, and RNG states.",
+                }
+            ),
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def _get_rng_state():
+    return {
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "torch_cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state):
+    if not state:
+        return
+    try:
+        if state.get("python_random_state") is not None:
+            random.setstate(state["python_random_state"])
+        if state.get("numpy_random_state") is not None:
+            np.random.set_state(state["numpy_random_state"])
+        if state.get("torch_rng_state") is not None:
+            torch.set_rng_state(state["torch_rng_state"])
+        cuda_state = state.get("torch_cuda_rng_state_all")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
+    except Exception as exc:
+        logging.warning("Failed to restore checkpoint RNG state: {}".format(exc))
+
+
 def _save_resume_checkpoint(model, save_path, task, history_state=None, extra_state=None):
     network = model._network.module if hasattr(model._network, "module") else model._network
     history_state = history_state or {}
@@ -312,6 +511,10 @@ def _save_resume_checkpoint(model, save_path, task, history_state=None, extra_st
         "known_classes": model._known_classes,
         "total_classes": model._total_classes,
         "model_state_dict": network.state_dict(),
+        "args": copy.deepcopy(model.args),
+        "args_json_ready": _json_ready(model.args),
+        "runtime_reproducibility": _runtime_reproducibility_metadata(model.args),
+        "rng_state": _get_rng_state(),
         "data_memory": model._data_memory,
         "targets_memory": model._targets_memory,
         "class_means": getattr(model, "_class_means", None),
@@ -327,9 +530,51 @@ def _save_resume_checkpoint(model, save_path, task, history_state=None, extra_st
     torch.save(ckpt, save_path)
 
 
-def _eval_cnn_only(model):
+def _eval_cnn_outputs(model):
     y_pred, y_true = model._eval_cnn(model.test_loader)
-    return model._evaluate(y_pred, y_true)
+    return model._evaluate(y_pred, y_true), y_pred, y_true
+
+
+def _eval_cnn_only(model):
+    accy, _, _ = _eval_cnn_outputs(model)
+    return accy
+
+
+def _compute_analysis_class_means(model, data_manager):
+    class_means = np.zeros((model._total_classes, model.feature_dim))
+    batch_size = int(model.args.get("analysis_nme_batch_size", 64))
+    num_workers = int(model.args.get("analysis_nme_num_workers", 4))
+    pin_memory = getattr(model._device, "type", "cpu") == "cuda"
+
+    for class_idx in range(model._total_classes):
+        _, _, class_dataset = data_manager.get_dataset(
+            np.arange(class_idx, class_idx + 1),
+            source="train",
+            mode="test",
+            ret_data=True,
+        )
+        class_loader = DataLoader(
+            class_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        vectors, _ = model._extract_vectors(class_loader)
+        vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
+        mean = np.mean(vectors, axis=0)
+        mean_norm = np.linalg.norm(mean)
+        if mean_norm > EPSILON:
+            mean = mean / mean_norm
+        class_means[class_idx, :] = mean
+
+    return class_means
+
+
+def _eval_nme_with_fresh_class_means(model, data_manager):
+    class_means = _compute_analysis_class_means(model, data_manager)
+    y_pred, y_true = model._eval_nme(model.test_loader, class_means)
+    return model._evaluate(y_pred, y_true), y_pred, y_true, class_means
 
 
 def _json_ready(value):
@@ -341,25 +586,40 @@ def _json_ready(value):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
-    return value
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
 
 
-def _accuracy_row(stage, accy):
+def _accuracy_row(stage, accy, method=None):
     row = {
         "stage": stage,
-        "top1": accy.get("top1"),
-        "top5": accy.get("top5"),
     }
+    if method is not None:
+        row["method"] = method
+    if accy is None:
+        return row
+
+    row["top1"] = accy.get("top1")
+    row["top5"] = accy.get("top5")
     for key, value in accy.get("grouped", {}).items():
         safe_key = str(key).replace("-", "_")
         row[f"group_{safe_key}"] = value
     return row
 
 
-def _delta_row(before_row, after_row):
+def _delta_row(before_row, after_row, method=None):
     row = {"stage": "delta_after_minus_before"}
+    if method is not None:
+        row["method"] = method
     for key, before_value in before_row.items():
-        if key == "stage":
+        if key in ("stage", "method"):
             continue
         after_value = after_row.get(key)
         if isinstance(before_value, (int, float, np.number)) and isinstance(
@@ -369,12 +629,27 @@ def _delta_row(before_row, after_row):
     return row
 
 
-def _save_final_sigreg_accuracy(artifact_dir, task, before_cnn_accy, after_cnn_accy, final_state):
+def _save_final_sigreg_accuracy(
+    artifact_dir,
+    task,
+    before_cnn_accy,
+    after_cnn_accy,
+    before_nme_accy,
+    after_nme_accy,
+    final_state,
+):
     os.makedirs(artifact_dir, exist_ok=True)
-    before_row = _accuracy_row("before_final_sigreg", before_cnn_accy)
-    after_row = _accuracy_row("after_final_sigreg", after_cnn_accy)
-    delta_row = _delta_row(before_row, after_row)
-    rows = [before_row, after_row, delta_row]
+    before_cnn_row = _accuracy_row("before_final_sigreg", before_cnn_accy, "CNN")
+    after_cnn_row = _accuracy_row("after_final_sigreg", after_cnn_accy, "CNN")
+    cnn_delta_row = _delta_row(before_cnn_row, after_cnn_row, "CNN")
+    rows = [before_cnn_row, after_cnn_row, cnn_delta_row]
+
+    nme_delta_row = None
+    if before_nme_accy is not None and after_nme_accy is not None:
+        before_nme_row = _accuracy_row("before_final_sigreg", before_nme_accy, "NME_analysis")
+        after_nme_row = _accuracy_row("after_final_sigreg", after_nme_accy, "NME_analysis")
+        nme_delta_row = _delta_row(before_nme_row, after_nme_row, "NME_analysis")
+        rows.extend([before_nme_row, after_nme_row, nme_delta_row])
 
     csv_path = os.path.join(artifact_dir, "final_sigreg_task_{}_accuracy.csv".format(task))
     fieldnames = []
@@ -395,7 +670,10 @@ def _save_final_sigreg_accuracy(artifact_dir, task, before_cnn_accy, after_cnn_a
                     "task_id": task,
                     "before_cnn": before_cnn_accy,
                     "after_cnn": after_cnn_accy,
-                    "delta_after_minus_before": delta_row,
+                    "cnn_delta_after_minus_before": cnn_delta_row,
+                    "before_nme_analysis": before_nme_accy,
+                    "after_nme_analysis": after_nme_accy,
+                    "nme_analysis_delta_after_minus_before": nme_delta_row,
                     "final_sigreg_state": final_state,
                 }
             ),
@@ -403,6 +681,164 @@ def _save_final_sigreg_accuracy(artifact_dir, task, before_cnn_accy, after_cnn_a
             indent=2,
         )
 
+
+def _save_model_confusions(model, artifact_dir, task, stage):
+    cnn_accy, y_pred, y_true = _eval_cnn_outputs(model)
+    _save_confusion_artifacts(
+        artifact_dir,
+        task,
+        stage,
+        "CNN",
+        y_pred,
+        y_true,
+        model._total_classes,
+        summary=cnn_accy,
+    )
+
+    class_means = getattr(model, "_class_means", None)
+    if class_means is None:
+        return
+
+    y_pred, y_true = model._eval_nme(model.test_loader, class_means)
+    nme_accy = model._evaluate(y_pred, y_true)
+    _save_confusion_artifacts(
+        artifact_dir,
+        task,
+        stage,
+        "NME",
+        y_pred,
+        y_true,
+        model._total_classes,
+        summary=nme_accy,
+    )
+
+
+def _save_confusion_artifacts(
+    artifact_dir,
+    task,
+    stage,
+    method,
+    y_pred,
+    y_true,
+    num_classes,
+    summary=None,
+):
+    os.makedirs(artifact_dir, exist_ok=True)
+    pred_top1 = y_pred.T[0] if getattr(y_pred, "ndim", 1) == 2 else y_pred
+    raw = _confusion_matrix(y_true, pred_top1, num_classes)
+    row_norm = _row_normalize_confusion(raw)
+
+    safe_stage = str(stage).replace("/", "_")
+    safe_method = str(method).replace("/", "_")
+    stem = "task_{}_{}_{}".format(task, safe_stage, safe_method)
+
+    raw_csv = os.path.join(artifact_dir, stem + "_confusion_raw.csv")
+    norm_csv = os.path.join(artifact_dir, stem + "_confusion_row_normalized.csv")
+    _write_confusion_csv(raw_csv, raw, integer=True)
+    _write_confusion_csv(norm_csv, row_norm, integer=False)
+
+    np.save(os.path.join(artifact_dir, stem + "_confusion_raw.npy"), raw)
+    np.save(os.path.join(artifact_dir, stem + "_confusion_row_normalized.npy"), row_norm)
+
+    meta_path = os.path.join(artifact_dir, stem + "_confusion_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            _json_ready(
+                {
+                    "task_id": task,
+                    "stage": stage,
+                    "method": method,
+                    "num_classes": num_classes,
+                    "summary": summary,
+                    "raw_csv": raw_csv,
+                    "row_normalized_csv": norm_csv,
+                }
+            ),
+            f,
+            indent=2,
+        )
+
+    _try_plot_confusion(
+        raw,
+        os.path.join(artifact_dir, stem + "_confusion_raw.png"),
+        "{} {} task {} raw".format(stage, method, task),
+        normalized=False,
+    )
+    _try_plot_confusion(
+        row_norm,
+        os.path.join(artifact_dir, stem + "_confusion_row_normalized.png"),
+        "{} {} task {} row-normalized".format(stage, method, task),
+        normalized=True,
+    )
+
+
+def _confusion_matrix(y_true, y_pred, num_classes):
+    matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for true_label, pred_label in zip(y_true, y_pred):
+        true_label = int(true_label)
+        pred_label = int(pred_label)
+        if 0 <= true_label < num_classes and 0 <= pred_label < num_classes:
+            matrix[true_label, pred_label] += 1
+    return matrix
+
+
+def _row_normalize_confusion(matrix):
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    return np.divide(
+        matrix,
+        row_sums,
+        out=np.zeros_like(matrix, dtype=np.float64),
+        where=row_sums != 0,
+    )
+
+
+def _write_confusion_csv(path, matrix, integer=False):
+    labels = list(range(matrix.shape[0]))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["true\\pred"] + labels)
+        for label, row in zip(labels, matrix):
+            if integer:
+                values = [int(v) for v in row]
+            else:
+                values = [float(np.around(v, decimals=6)) for v in row]
+            writer.writerow([label] + values)
+
+
+def _try_plot_confusion(matrix, path, title, normalized=False):
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logging.warning("matplotlib unavailable; skip confusion matrix figure {}: {}".format(path, exc))
+        return
+
+    num_classes = matrix.shape[0]
+    fig_size = max(6, min(14, num_classes * 0.45))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    image = ax.imshow(matrix, interpolation="nearest", cmap="Blues")
+    ax.set_title(title)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_xticks(range(num_classes))
+    ax.set_yticks(range(num_classes))
+    ax.tick_params(axis="x", labelrotation=90)
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+    if num_classes <= 20:
+        threshold = matrix.max() * 0.5 if matrix.size and matrix.max() > 0 else 0.0
+        for i in range(num_classes):
+            for j in range(num_classes):
+                value = matrix[i, j]
+                text = "{:.2f}".format(value) if normalized else str(int(value))
+                color = "white" if value > threshold else "black"
+                ax.text(j, i, text, ha="center", va="center", color=color, fontsize=7)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
 
 def _resume_from_checkpoint(model, data_manager, resume_path):
     ckpt = torch.load(resume_path, map_location="cpu")
@@ -433,6 +869,8 @@ def _resume_from_checkpoint(model, data_manager, resume_path):
                 logging.info("Loaded SIGReg matrix state from checkpoint.")
         else:
             logging.warning("Checkpoint does not contain SIGReg matrix state; SIGReg matrix will be reinitialized.")
+
+    _restore_rng_state(ckpt.get("rng_state"))
 
     model.after_task()
     history_state = {

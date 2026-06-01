@@ -348,6 +348,175 @@ class TagFex(BaseLearner):
             for i in range(self._cur_task):
                 ptr.convnets[i].eval()
 
+
+    def _record_accuracy_curves_enabled(self):
+        return bool(self.args.get("record_accuracy_curves", False)) and self.args.get("local_rank", 0) <= 0
+
+    def _diagnostic_eval_interval(self):
+        return max(1, int(self.args.get("diagnostic_eval_interval", 10)))
+
+    def _should_record_diagnostic_test(self, epoch, total_epochs):
+        if not self._record_accuracy_curves_enabled():
+            return False
+        interval = self._diagnostic_eval_interval()
+        return epoch == 0 or (epoch + 1) % interval == 0 or (epoch + 1) == total_epochs
+
+    def _new_accuracy_counts(self):
+        return {
+            "total_correct": 0,
+            "total_count": 0,
+            "old_correct": 0,
+            "old_count": 0,
+            "new_correct": 0,
+            "new_count": 0,
+        }
+
+    def _update_accuracy_counts(self, counts, preds, targets):
+        preds = preds.detach().cpu()
+        targets = targets.detach().cpu()
+        correct = preds.eq(targets)
+
+        counts["total_correct"] += int(correct.sum().item())
+        counts["total_count"] += int(targets.numel())
+
+        old_mask = targets < self._known_classes
+        new_mask = targets >= self._known_classes
+        if old_mask.any():
+            counts["old_correct"] += int(correct[old_mask].sum().item())
+            counts["old_count"] += int(old_mask.sum().item())
+        if new_mask.any():
+            counts["new_correct"] += int(correct[new_mask].sum().item())
+            counts["new_count"] += int(new_mask.sum().item())
+
+    def _accuracy_counts_to_metrics(self, counts):
+        def acc(correct, total):
+            if total == 0:
+                return None
+            return float(np.around(correct * 100.0 / total, decimals=2))
+
+        return {
+            "total_acc": acc(counts["total_correct"], counts["total_count"]),
+            "old_acc": acc(counts["old_correct"], counts["old_count"]),
+            "new_acc": acc(counts["new_correct"], counts["new_count"]),
+            "total_count": counts["total_count"],
+            "old_count": counts["old_count"],
+            "new_count": counts["new_count"],
+        }
+
+    def _prediction_metrics(self, y_pred, y_true):
+        pred_top1 = y_pred.T[0] if getattr(y_pred, "ndim", 1) == 2 else y_pred
+        pred_top1 = np.asarray(pred_top1)
+        y_true = np.asarray(y_true)
+        correct = pred_top1 == y_true
+        old_mask = y_true < self._known_classes
+        new_mask = y_true >= self._known_classes
+
+        def acc(mask):
+            count = int(mask.sum())
+            if count == 0:
+                return None, 0
+            return float(np.around(correct[mask].sum() * 100.0 / count, decimals=2)), count
+
+        old_acc, old_count = acc(old_mask)
+        new_acc, new_count = acc(new_mask)
+        total_count = int(y_true.shape[0])
+        total_acc = None if total_count == 0 else float(np.around(correct.sum() * 100.0 / total_count, decimals=2))
+        return {
+            "total_acc": total_acc,
+            "old_acc": old_acc,
+            "new_acc": new_acc,
+            "total_count": total_count,
+            "old_count": old_count,
+            "new_count": new_count,
+        }
+
+    def _eval_cnn_curve_metrics(self, loader):
+        y_pred, y_true = self._eval_cnn(loader)
+        return self._prediction_metrics(y_pred, y_true)
+
+    def _append_accuracy_curve_row(self, row):
+        diagnostics_dir = self.args.get("diagnostics_dir")
+        if not diagnostics_dir:
+            return
+        os.makedirs(diagnostics_dir, exist_ok=True)
+        csv_path = os.path.join(
+            diagnostics_dir,
+            "accuracy_curves_task_{}.csv".format(self._cur_task),
+        )
+        fieldnames = [
+            "task_id",
+            "phase",
+            "epoch",
+            "split",
+            "total_acc",
+            "old_acc",
+            "new_acc",
+            "total_count",
+            "old_count",
+            "new_count",
+            "loss",
+            "lr",
+            "known_classes",
+            "total_classes",
+        ]
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _record_epoch_accuracy_diagnostics(
+        self,
+        phase,
+        epoch,
+        total_epochs,
+        train_counts,
+        avg_loss,
+        lr,
+        test_loader,
+    ):
+        if not self._record_accuracy_curves_enabled() or train_counts is None:
+            return
+
+        train_metrics = self._accuracy_counts_to_metrics(train_counts)
+        base_row = {
+            "task_id": self._cur_task,
+            "phase": phase,
+            "epoch": epoch + 1,
+            "loss": float(avg_loss),
+            "lr": float(lr),
+            "known_classes": self._known_classes,
+            "total_classes": self._total_classes,
+        }
+        train_row = dict(base_row)
+        train_row.update({"split": "train", **train_metrics})
+        self._append_accuracy_curve_row(train_row)
+
+        metric_prefix = f"Task_{self._cur_task}/Diagnostics/{phase}"
+        log_payload = {
+            f"{metric_prefix}/train_total_acc": train_metrics["total_acc"],
+            f"{metric_prefix}/train_old_acc": train_metrics["old_acc"],
+            f"{metric_prefix}/train_new_acc": train_metrics["new_acc"],
+        }
+
+        if self._should_record_diagnostic_test(epoch, total_epochs):
+            test_metrics = self._eval_cnn_curve_metrics(test_loader)
+            test_row = dict(base_row)
+            test_row.update({"split": "test", **test_metrics})
+            self._append_accuracy_curve_row(test_row)
+            log_payload.update(
+                {
+                    f"{metric_prefix}/test_total_acc": test_metrics["total_acc"],
+                    f"{metric_prefix}/test_old_acc": test_metrics["old_acc"],
+                    f"{metric_prefix}/test_new_acc": test_metrics["new_acc"],
+                }
+            )
+
+        log_payload = {key: value for key, value in log_payload.items() if value is not None}
+        if log_payload:
+            swanlab.log(log_payload, step=epoch + 1)
+
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
         self.sig_reg.to(self._device)
@@ -407,6 +576,7 @@ class TagFex(BaseLearner):
 
             self.train()
             losses, correct, total = 0.0, 0, 0
+            diagnostic_counts = self._new_accuracy_counts() if self._record_accuracy_curves_enabled() else None
             for i, data in enumerate(train_loader):
                 vs = data[1].to(self._device)
                 targets = data[-1].to(self._device)
@@ -476,14 +646,27 @@ class TagFex(BaseLearner):
                 losses += loss.item()
                 correct += batch_correct
                 total += batch_total  # 统计总预测数 (N*V)
+                if diagnostic_counts is not None:
+                    self._update_accuracy_counts(diagnostic_counts, preds, y_rep)
 
 
 
+            avg_loss = losses / len(train_loader)
             if not disable_tqdm:
                 train_acc = np.around(correct * 100 / total, decimals=2)
 
                 prog_bar.set_description(
-                    f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} Loss {losses / len(train_loader):.3f}, Acc {train_acc:.2f}")
+                    f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} Loss {avg_loss:.3f}, Acc {train_acc:.2f}")
+
+            self._record_epoch_accuracy_diagnostics(
+                "init",
+                epoch,
+                init_epoch,
+                diagnostic_counts,
+                avg_loss,
+                optimizer.param_groups[0]['lr'],
+                test_loader,
+            )
 
     def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
         local_rank = self.args.get("local_rank", 0)
@@ -503,6 +686,7 @@ class TagFex(BaseLearner):
 
             self.train()
             losses, losses_clf, losses_aux, correct, total = 0.0, 0.0, 0.0, 0, 0
+            diagnostic_counts = self._new_accuracy_counts() if self._record_accuracy_curves_enabled() else None
             for i, data in enumerate(train_loader):
                 vs = data[1].to(self._device)  # [Batch, 8, 3, 224, 224]
                 targets = data[-1].to(self._device)  # [Batch]
@@ -579,6 +763,8 @@ class TagFex(BaseLearner):
                 batch_acc = preds.eq(y_rep).sum().item() * 100.0 / y_rep.size(0)
                 correct += preds.eq(y_rep).cpu().sum()
                 total += len(y_rep)
+                if diagnostic_counts is not None:
+                    self._update_accuracy_counts(diagnostic_counts, preds, y_rep)
                 # ==========================================================================================
                 # [Loss Functions Summary - TagFex with LeJEPA]
                 # 1. 核心分类 (Task-specific Classification):
@@ -615,13 +801,22 @@ class TagFex(BaseLearner):
                 # -------------------------------
 
 
+            avg_loss = losses / len(train_loader)
             if not disable_tqdm:
                 train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-                avg_loss = losses / len(train_loader)
-
                 prog_bar.set_description(
-                    f"Task {self._cur_task} Epoch {epoch + 1}/{epochs} Loss {losses / len(train_loader):.3f} Acc {train_acc:.2f}")
+                    f"Task {self._cur_task} Epoch {epoch + 1}/{epochs} Loss {avg_loss:.3f} Acc {train_acc:.2f}")
+
+            self._record_epoch_accuracy_diagnostics(
+                "update",
+                epoch,
+                epochs,
+                diagnostic_counts,
+                avg_loss,
+                optimizer.param_groups[0]['lr'],
+                test_loader,
+            )
 
     def _compute_accuracy(self, model, loader):
         model.eval()
