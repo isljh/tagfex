@@ -74,6 +74,7 @@ def _train(args):
         print_args(args)
 
     # 5. 初始化数据和模型
+    _apply_data_root(args)
     data_manager = DataManager(
         args["dataset"],
         args["shuffle"],
@@ -227,6 +228,16 @@ def print_args(args):
             "Running in debug mode with uncommitted changes. "
             "This run is not a clean, fully reproducible experiment snapshot."
         )
+
+
+def _apply_data_root(args):
+    data_root = args.get("data_root")
+    if not data_root:
+        return
+
+    os.environ["TAGFEX_DATA_ROOT"] = data_root
+    if "imagenet100" in str(args.get("dataset", "")).lower():
+        os.environ["TAGFEX_IMAGENET100_ROOT"] = data_root
 
 
 def _build_log_root(args, init_cls):

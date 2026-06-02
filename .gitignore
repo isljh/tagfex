@@ -2,3 +2,6 @@ data/
 __pycache__/
 logs/
 .vscode/
+tagfex_logs/
+outputs/
+reference_flygcl/

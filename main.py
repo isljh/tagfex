@@ -38,6 +38,7 @@ def main():
         'rnd_seed',
         'setting',
         'data_protocol',
+        'data_root',
         'si_blurry',
         'n_tasks',
         'n',
@@ -90,6 +91,7 @@ def setup_parser():
     parser.add_argument('--rnd_seed', type=int)
     parser.add_argument('--setting', type=str)
     parser.add_argument('--data_protocol', type=str)
+    parser.add_argument('--data_root', type=str)
     parser.add_argument('--si_blurry', action='store_true', default=None)
     parser.add_argument('--n_tasks', type=int)
     parser.add_argument('--n', type=int)

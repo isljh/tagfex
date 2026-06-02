@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 from torchvision import datasets, transforms
@@ -5,6 +7,30 @@ from utils.toolkit import split_images_labels
 from . import autoaugment
 from . import ops
 from .autoaugment import ImageNetPolicy
+
+
+def _get_data_root(env_key, default_root):
+    return os.environ.get(env_key) or os.environ.get("TAGFEX_DATA_ROOT") or default_root
+
+
+def _get_split_dirs(root):
+    train_dir = os.path.join(root, "train")
+    val_dir = os.path.join(root, "val")
+    test_dir = os.path.join(root, "test")
+    return train_dir, test_dir if os.path.isdir(test_dir) and not os.path.isdir(val_dir) else val_dir
+
+
+def _split_imagefolder_subset(imagefolder, max_classes=None):
+    if max_classes is None or len(imagefolder.classes) <= max_classes:
+        return split_images_labels(imagefolder.imgs)
+
+    keep = set(range(max_classes))
+    images, targets = [], []
+    for path, target in imagefolder.imgs:
+        if target in keep:
+            images.append(path)
+            targets.append(target)
+    return images, np.asarray(targets)
 
 class iData(object):
     train_trsf = []
@@ -162,16 +188,19 @@ class iImageNet100(iData):
         train_dir = "/media/DATASET/person_data/ImageNet100/train/"
         test_dir = "/media/DATASET/person_data/ImageNet100/val/"
         """
-        train_dir = "/root/autodl-tmp/datasets/ImageNet100/train/"
-        test_dir = "/root/autodl-tmp/datasets/ImageNet100/val/"
+        data_root = _get_data_root(
+            "TAGFEX_IMAGENET100_ROOT",
+            "/root/autodl-tmp/datasets/ImageNet100",
+        )
+        train_dir, test_dir = _get_split_dirs(data_root)
         #train_dir = "E:/continual-learning/datasets/ImageNet100/train"
         #test_dir = "E:/continual-learning/datasets/ImageNet100/val"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
 
-        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
-        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+        self.train_data, self.train_targets = _split_imagefolder_subset(train_dset, 100)
+        self.test_data, self.test_targets = _split_imagefolder_subset(test_dset, 100)
 
 class iImageNet100_AA(iImageNet100):
     use_path = True
