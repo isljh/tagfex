@@ -31,8 +31,12 @@ def _train(args):
     # 获取分布式信息
     is_distributed = args.get("is_distributed", False)
     local_rank = args.get("local_rank", 0)
+    args.pop("task_increments", None)
+    args.pop("si_blurry_eval_groups", None)
 
-    init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
+    init_cls_arg = args.get("init_cls", args.get("increment", 0))
+    increment_arg = args.get("increment", init_cls_arg)
+    init_cls = 0 if init_cls_arg == increment_arg else init_cls_arg
     log_root = _build_log_root(args, init_cls)
     resume_path = _resolve_resume_path(args, log_root)
 
@@ -79,16 +83,21 @@ def _train(args):
         print_args(args)
 
     # 5. 初始化数据和模型
+    _apply_data_root(args)
     data_manager = DataManager(
         args["dataset"],
         args["shuffle"],
         args["seed"],
-        args["init_cls"],
-        args["increment"],
+        init_cls_arg,
+        increment_arg,
         args["aug"] if "aug" in args else 1,
+        args=args,
     )
     args["class_order"] = list(getattr(data_manager, "_class_order", []))
-    args["task_increments"] = list(getattr(data_manager, "_increments", []))
+    args["task_increments"] = data_manager.get_task_sizes()
+    si_blurry_eval_groups = data_manager.get_si_blurry_eval_groups()
+    if si_blurry_eval_groups is not None:
+        args["si_blurry_eval_groups"] = si_blurry_eval_groups
     if local_rank <= 0:
         _save_run_reproducibility(args, logs_name)
 
@@ -110,6 +119,7 @@ def _train(args):
 
     # 6. 开始任务循环
     for task in range(start_task, data_manager.nb_tasks):
+        data_manager.set_current_task(task)
         if local_rank <= 0:
             logging.info("All params: {}".format(count_parameters(model._network)))
             logging.info("Trainable params: {}".format(count_parameters(model._network, True)))
@@ -390,8 +400,31 @@ def print_args(args):
         )
 
 
+def _apply_data_root(args):
+    data_root = args.get("data_root")
+    if not data_root:
+        return
+
+    os.environ["TAGFEX_DATA_ROOT"] = data_root
+    if "imagenet100" in str(args.get("dataset", "")).lower():
+        os.environ["TAGFEX_IMAGENET100_ROOT"] = data_root
+
+
 def _build_log_root(args, init_cls):
     base_log_dir = args.get("log_root", "logs")
+    setting = str(args.get("setting") or args.get("data_protocol") or "").lower()
+    if args.get("si_blurry", False) or setting in {"si_blurry", "flygcl"}:
+        return os.path.join(
+            base_log_dir,
+            args["prefix"],
+            args["dataset"],
+            "si_blurry",
+            "tasks{}_n{}_m{}".format(
+                args.get("n_tasks", 5),
+                args.get("n", 50),
+                args.get("m", 10),
+            ),
+        )
     return os.path.join(
         base_log_dir,
         args["prefix"],

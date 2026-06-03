@@ -1,4 +1,5 @@
 import os
+
 import numpy as np
 import torch
 from torchvision import datasets, transforms
@@ -8,12 +9,21 @@ from . import ops
 from .autoaugment import ImageNetPolicy
 
 
-def _get_data_root(default_root="./data"):
-    return os.environ.get("TAGFEX_DATA_ROOT", default_root)
+def _get_data_root(env_key=None, default_root="./data"):
+    if env_key is not None:
+        return os.environ.get(env_key) or os.environ.get("TAGFEX_DATA_ROOT") or default_root
+    return os.environ.get("TAGFEX_DATA_ROOT") or default_root
+
+
+def _get_split_dirs(root):
+    train_dir = os.path.join(root, "train")
+    val_dir = os.path.join(root, "val")
+    test_dir = os.path.join(root, "test")
+    return train_dir, test_dir if os.path.isdir(test_dir) and not os.path.isdir(val_dir) else val_dir
 
 
 def _get_imagenet100_dirs():
-    data_root = os.environ.get("TAGFEX_DATA_ROOT")
+    data_root = os.environ.get("TAGFEX_IMAGENET100_ROOT") or os.environ.get("TAGFEX_DATA_ROOT")
     candidate_roots = []
     if data_root:
         candidate_roots.append(data_root)
@@ -26,16 +36,24 @@ def _get_imagenet100_dirs():
     )
 
     for root in candidate_roots:
-        train_dir = os.path.join(root, "train")
-        val_dir = os.path.join(root, "val")
-        test_dir = os.path.join(root, "test")
-        if os.path.isdir(train_dir) and os.path.isdir(val_dir):
-            return train_dir, val_dir
+        train_dir, test_dir = _get_split_dirs(root)
         if os.path.isdir(train_dir) and os.path.isdir(test_dir):
             return train_dir, test_dir
 
-    root = data_root or candidate_roots[0]
-    return os.path.join(root, "train"), os.path.join(root, "val")
+    return _get_split_dirs(data_root or candidate_roots[0])
+
+
+def _split_imagefolder_subset(imagefolder, max_classes=None):
+    if max_classes is None or len(imagefolder.classes) <= max_classes:
+        return split_images_labels(imagefolder.imgs)
+
+    keep = set(range(max_classes))
+    images, targets = [], []
+    for path, target in imagefolder.imgs:
+        if target in keep:
+            images.append(path)
+            targets.append(target)
+    return images, np.asarray(targets)
 
 
 class iData(object):
@@ -203,8 +221,8 @@ class iImageNet100(iData):
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
 
-        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
-        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+        self.train_data, self.train_targets = _split_imagefolder_subset(train_dset, 100)
+        self.test_data, self.test_targets = _split_imagefolder_subset(test_dset, 100)
 
 class iImageNet100_AA(iImageNet100):
     use_path = True

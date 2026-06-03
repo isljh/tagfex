@@ -6,13 +6,20 @@ from torchvision import transforms
 from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR10_AA, iCIFAR100_AA, iImageNet100_AA, \
     iImageNet100_LeJEPA, iCIFAR100_LeJEPA
 from tqdm import tqdm
+from utils.si_blurry_sampler import SiBlurrySampler
 import torch
 
 class DataManager(object):
-    def __init__(self, dataset_name, shuffle, seed, init_cls, increment, aug=1):
+    def __init__(self, dataset_name, shuffle, seed, init_cls, increment, aug=1, args=None):
         self.dataset_name = dataset_name
         self.aug = aug
-        self._setup_data(dataset_name, shuffle, seed)
+        self.args = args or {}
+        self.use_si_blurry = _is_si_blurry(self.args)
+        self._current_task = None
+        self._setup_data(dataset_name, shuffle, seed, defer_class_mapping=self.use_si_blurry)
+        if self.use_si_blurry:
+            self._setup_si_blurry(seed)
+            return
         assert init_cls <= len(self._class_order), "No enough classes."
         #_increments列表[10,10,10...]
         self._increments = [init_cls]
@@ -29,6 +36,14 @@ class DataManager(object):
 
     def get_task_size(self, task):
         return self._increments[task]
+
+    def get_task_sizes(self):
+        return list(self._increments)
+
+    def set_current_task(self, task):
+        self._current_task = task
+        if self.use_si_blurry:
+            self.train_sampler.set_task(task)
     
     def get_accumulate_tasksize(self,task):
         return sum(self._increments[:task+1])
@@ -65,7 +80,17 @@ class DataManager(object):
             raise ValueError("Unknown mode {}.".format(mode))
 
         data, targets = [], []
-        for idx in indices:
+        if self.use_si_blurry and source == "train" and self._use_current_session(indices, ret_data, mode):
+            session_data, session_targets = self._get_si_blurry_session_data()
+            data.append(session_data)
+            targets.append(session_targets)
+        elif self.use_si_blurry and source == "train" and ret_data:
+            for idx in indices:
+                class_data, class_targets = self._select_si_blurry_seen_class(idx)
+                data.append(class_data)
+                targets.append(class_targets)
+
+        for idx in ([] if len(data) > 0 else indices):
             if m_rate is None:
                 #data = [所有类0样本, 所有类1样本...] targets = [所有0标签, 所有1标签...]
                 class_data, class_targets = self._select(
@@ -83,7 +108,7 @@ class DataManager(object):
             data.append(appendent_data)
             targets.append(appendent_targets)
 
-        data, targets = np.concatenate(data), np.concatenate(targets)
+        data, targets = _concat_data_targets(data, targets, self.use_path)
         #data = [所有类0样本, 所有类1样本...appendent_data] targets = [所有0标签, 所有1标签...appendent_targets]
         if ret_data:
             return data, targets, DummyDataset(data, targets, trsf, self.use_path,self.aug if source == "train" and mode == "train" else 1)
@@ -193,7 +218,7 @@ class DataManager(object):
             train_data, train_targets, trsf, self.use_path, self.aug
         ), DummyDataset(val_data, val_targets, trsf, self.use_path)
 
-    def _setup_data(self, dataset_name, shuffle, seed):
+    def _setup_data(self, dataset_name, shuffle, seed, defer_class_mapping=False):
         idata = _get_idata(dataset_name)
         idata.download_data()
 
@@ -216,6 +241,8 @@ class DataManager(object):
             order = idata.class_order
         self._class_order = order
         logging.info(self._class_order)
+        if defer_class_mapping:
+            return
 
         # Map indices 重新映射标签
         self._train_targets = _map_new_class_index(
@@ -246,6 +273,127 @@ class DataManager(object):
         else:
             new_idxes = np.where(np.logical_and(y >= low_range, y < high_range))[0]
         return x[new_idxes], y[new_idxes]
+
+    def _setup_si_blurry(self, seed):
+        n_tasks = int(_arg_or_default(self.args, "n_tasks", 5))
+        n = int(_arg_or_default(self.args, "n", _arg_or_default(self.args, "disjoint_ratio", 50)))
+        m = int(_arg_or_default(self.args, "m", _arg_or_default(self.args, "blurry_ratio", 10)))
+        rnd_NM = bool(_arg_or_default(self.args, "rnd_NM", True))
+        rnd_seed = int(_arg_or_default(self.args, "rnd_seed", seed))
+
+        raw_train_targets = np.asarray(self._train_targets)
+        raw_test_targets = np.asarray(self._test_targets)
+        classes = sorted(np.unique(raw_train_targets).astype(int).tolist())
+        self.train_sampler = SiBlurrySampler(
+            raw_train_targets,
+            classes,
+            num_tasks=n_tasks,
+            m=m,
+            n=n,
+            rnd_seed=rnd_seed,
+            rnd_NM=rnd_NM,
+        )
+
+        exposure_order = []
+        exposed = set()
+        new_classes_by_task = []
+        session_classes_by_task = []
+        for task_indices in self.train_sampler.indices:
+            task_new = []
+            task_session_classes = []
+            for sample_idx in task_indices:
+                class_id = int(raw_train_targets[sample_idx])
+                if class_id not in task_session_classes:
+                    task_session_classes.append(class_id)
+                if class_id not in exposed:
+                    exposed.add(class_id)
+                    exposure_order.append(class_id)
+                    task_new.append(class_id)
+            new_classes_by_task.append(task_new)
+            session_classes_by_task.append(task_session_classes)
+
+        for class_id in classes:
+            if class_id not in exposed:
+                exposure_order.append(class_id)
+
+        self._class_order = exposure_order
+        self._train_targets = _map_new_class_index(raw_train_targets, self._class_order)
+        self._test_targets = _map_new_class_index(raw_test_targets, self._class_order)
+
+        old_to_new = {old: new for new, old in enumerate(self._class_order)}
+        self._si_blurry_new_classes = [
+            [old_to_new[c] for c in task_classes] for task_classes in new_classes_by_task
+        ]
+        self._si_blurry_disjoint_classes = [
+            sorted([old_to_new[c] for c in task_classes])
+            for task_classes in self.train_sampler.disjoint_classes
+        ]
+        self._si_blurry_session_classes = [
+            sorted([old_to_new[c] for c in task_classes])
+            for task_classes in session_classes_by_task
+        ]
+        self._increments = [len(task_classes) for task_classes in self._si_blurry_new_classes]
+        self._si_blurry_task_indices = [
+            np.asarray(task_indices, dtype=np.int64) for task_indices in self.train_sampler.indices
+        ]
+
+        cumulative = []
+        self._si_blurry_seen_indices = []
+        for task_indices in self._si_blurry_task_indices:
+            cumulative.extend(task_indices.tolist())
+            self._si_blurry_seen_indices.append(np.asarray(cumulative, dtype=np.int64))
+
+        logging.info(
+            "Using Si-Blurry split: n_tasks={}, n={}, m={}, rnd_NM={}, rnd_seed={}".format(
+                n_tasks, self.train_sampler.n, self.train_sampler.m, rnd_NM, rnd_seed
+            )
+        )
+        for task_id in range(n_tasks):
+            logging.info(
+                "Si-Blurry task {} | disjoint(raw)={} | blurry(raw)={} | "
+                "new(mapped)={} | session(mapped)={} | samples={}".format(
+                    task_id,
+                    self.train_sampler.disjoint_classes[task_id],
+                    self.train_sampler.blurry_classes[task_id],
+                    self._si_blurry_new_classes[task_id],
+                    self._si_blurry_session_classes[task_id],
+                    len(self._si_blurry_task_indices[task_id]),
+                )
+            )
+
+    def get_si_blurry_eval_groups(self):
+        if not self.use_si_blurry:
+            return None
+        return {
+            "disjoint": [list(task_classes) for task_classes in self._si_blurry_disjoint_classes],
+            "session": [list(task_classes) for task_classes in self._si_blurry_session_classes],
+        }
+
+    def _use_current_session(self, indices, ret_data, mode):
+        if self._current_task is None or ret_data:
+            return False
+        return len(indices) > 0 or mode == "train"
+
+    def _get_si_blurry_session_data(self):
+        task_indices = self._si_blurry_task_indices[self._current_task]
+        return self._select_by_indices(self._train_data, self._train_targets, task_indices)
+
+    def _select_si_blurry_seen_class(self, class_idx):
+        if self._current_task is None:
+            seen_indices = np.arange(len(self._train_targets))
+        else:
+            seen_indices = self._si_blurry_seen_indices[self._current_task]
+        labels = self._train_targets[seen_indices]
+        class_indices = seen_indices[np.where(labels == class_idx)[0]]
+        return self._select_by_indices(self._train_data, self._train_targets, class_indices)
+
+    def _select_by_indices(self, x, y, idxes):
+        idxes = np.asarray(idxes, dtype=np.int64)
+        if isinstance(x, np.ndarray):
+            x_return = x[idxes]
+        else:
+            x_return = [x[int(idx)] for idx in idxes]
+        return x_return, y[idxes]
 
     def getlen(self, index):
         y = self._train_targets
@@ -284,6 +432,38 @@ class DummyDataset(Dataset):
 
 def _map_new_class_index(y, order):
     return np.array(list(map(lambda x: order.index(x), y)))
+
+
+def _is_si_blurry(args):
+    setting = str(_arg_or_default(args, "setting", _arg_or_default(args, "data_protocol", ""))).lower()
+    si_blurry = _arg_or_default(args, "si_blurry", False)
+    if isinstance(si_blurry, str):
+        si_blurry = si_blurry.lower() in {"1", "true", "yes", "y"}
+    return bool(si_blurry) or setting in {"si_blurry", "flygcl"}
+
+
+def _arg_or_default(args, key, default):
+    value = args.get(key, default)
+    return default if value is None else value
+
+
+def _concat_data_targets(data, targets, use_path):
+    data = [d for d in data if len(d) > 0]
+    targets = [t for t in targets if len(t) > 0]
+    if len(data) == 0:
+        empty_data = np.asarray([]) if use_path else np.empty((0,))
+        return empty_data, np.asarray([], dtype=np.int64)
+    if use_path:
+        merged_data = []
+        for item in data:
+            if isinstance(item, np.ndarray):
+                merged_data.extend(item.tolist())
+            else:
+                merged_data.extend(item)
+        merged_data = np.asarray(merged_data)
+    else:
+        merged_data = np.concatenate(data)
+    return merged_data, np.concatenate(targets)
 
 
 def _get_idata(dataset_name):
