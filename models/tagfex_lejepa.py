@@ -171,8 +171,10 @@ class TagFex(BaseLearner):
         if local_rank <= 0:
             # 每个任务开始时，初始化或更新实验记录
             swanlab.init(
-                project="PyCIL_TagFex",
-                experiment_name=f"TagFex",
+                project=self.args.get("swanlab_project", "PyCIL_TagFex"),
+                experiment_name=self.args.get(
+                    "swanlab_experiment_name", self.args.get("prefix", "TagFex")
+                ),
                 config=self.args,  # 自动记录所有传入的 args
                 suffix="timestamp"  # 防止重名
             )
@@ -352,87 +354,73 @@ class TagFex(BaseLearner):
     def _record_accuracy_curves_enabled(self):
         return bool(self.args.get("record_accuracy_curves", False)) and self.args.get("local_rank", 0) <= 0
 
-    def _diagnostic_eval_interval(self):
-        return max(1, int(self.args.get("diagnostic_eval_interval", 10)))
+    def _si_blurry_curve_class_sets(self):
+        si_blurry_groups = self.args.get("si_blurry_eval_groups")
+        if not si_blurry_groups:
+            return set(), set()
 
-    def _should_record_diagnostic_test(self, epoch, total_epochs):
-        if not self._record_accuracy_curves_enabled():
-            return False
-        interval = self._diagnostic_eval_interval()
-        return epoch == 0 or (epoch + 1) % interval == 0 or (epoch + 1) == total_epochs
+        session_by_task = si_blurry_groups.get("session", [])
+        disjoint_by_task = si_blurry_groups.get("disjoint", [])
+        if len(session_by_task) == 0 or self._cur_task < 0:
+            return set(), set()
+
+        upto_task = min(self._cur_task, len(session_by_task) - 1)
+        exposed_classes = set()
+        for task_classes in session_by_task[: upto_task + 1]:
+            exposed_classes.update(int(class_idx) for class_idx in task_classes)
+        exposed_classes = {
+            class_idx for class_idx in exposed_classes if class_idx < self._total_classes
+        }
+
+        disjoint_classes = set()
+        for task_classes in disjoint_by_task[: upto_task + 1]:
+            disjoint_classes.update(int(class_idx) for class_idx in task_classes)
+        disjoint_classes = {
+            class_idx
+            for class_idx in disjoint_classes
+            if class_idx in exposed_classes and class_idx < self._total_classes
+        }
+        blurry_classes = exposed_classes - disjoint_classes
+        return disjoint_classes, blurry_classes
 
     def _new_accuracy_counts(self):
         return {
-            "total_correct": 0,
-            "total_count": 0,
-            "old_correct": 0,
-            "old_count": 0,
-            "new_correct": 0,
-            "new_count": 0,
+            "disjoint_only_correct": 0,
+            "disjoint_only_count": 0,
+            "blurry_exposed_correct": 0,
+            "blurry_exposed_count": 0,
         }
 
     def _update_accuracy_counts(self, counts, preds, targets):
-        preds = preds.detach().cpu()
-        targets = targets.detach().cpu()
-        correct = preds.eq(targets)
+        disjoint_classes, blurry_classes = self._si_blurry_curve_class_sets()
+        preds = preds.detach().cpu().numpy()
+        targets = targets.detach().cpu().numpy()
+        correct = preds == targets
 
-        counts["total_correct"] += int(correct.sum().item())
-        counts["total_count"] += int(targets.numel())
+        def update_group(prefix, class_set):
+            if len(class_set) == 0:
+                return
+            mask = np.isin(targets, list(class_set))
+            if not mask.any():
+                return
+            counts[f"{prefix}_correct"] += int(correct[mask].sum())
+            counts[f"{prefix}_count"] += int(mask.sum())
 
-        old_mask = targets < self._known_classes
-        new_mask = targets >= self._known_classes
-        if old_mask.any():
-            counts["old_correct"] += int(correct[old_mask].sum().item())
-            counts["old_count"] += int(old_mask.sum().item())
-        if new_mask.any():
-            counts["new_correct"] += int(correct[new_mask].sum().item())
-            counts["new_count"] += int(new_mask.sum().item())
+        update_group("disjoint_only", disjoint_classes)
+        update_group("blurry_exposed", blurry_classes)
 
     def _accuracy_counts_to_metrics(self, counts):
-        def acc(correct, total):
+        def acc(prefix):
+            total = counts[f"{prefix}_count"]
             if total == 0:
                 return None
+            correct = counts[f"{prefix}_correct"]
             return float(np.around(correct * 100.0 / total, decimals=2))
 
         return {
-            "total_acc": acc(counts["total_correct"], counts["total_count"]),
-            "old_acc": acc(counts["old_correct"], counts["old_count"]),
-            "new_acc": acc(counts["new_correct"], counts["new_count"]),
-            "total_count": counts["total_count"],
-            "old_count": counts["old_count"],
-            "new_count": counts["new_count"],
+            "disjoint_only_acc": acc("disjoint_only"),
+            "blurry_exposed_acc": acc("blurry_exposed"),
         }
-
-    def _prediction_metrics(self, y_pred, y_true):
-        pred_top1 = y_pred.T[0] if getattr(y_pred, "ndim", 1) == 2 else y_pred
-        pred_top1 = np.asarray(pred_top1)
-        y_true = np.asarray(y_true)
-        correct = pred_top1 == y_true
-        old_mask = y_true < self._known_classes
-        new_mask = y_true >= self._known_classes
-
-        def acc(mask):
-            count = int(mask.sum())
-            if count == 0:
-                return None, 0
-            return float(np.around(correct[mask].sum() * 100.0 / count, decimals=2)), count
-
-        old_acc, old_count = acc(old_mask)
-        new_acc, new_count = acc(new_mask)
-        total_count = int(y_true.shape[0])
-        total_acc = None if total_count == 0 else float(np.around(correct.sum() * 100.0 / total_count, decimals=2))
-        return {
-            "total_acc": total_acc,
-            "old_acc": old_acc,
-            "new_acc": new_acc,
-            "total_count": total_count,
-            "old_count": old_count,
-            "new_count": new_count,
-        }
-
-    def _eval_cnn_curve_metrics(self, loader):
-        y_pred, y_true = self._eval_cnn(loader)
-        return self._prediction_metrics(y_pred, y_true)
 
     def _append_accuracy_curve_row(self, row):
         diagnostics_dir = self.args.get("diagnostics_dir")
@@ -448,12 +436,8 @@ class TagFex(BaseLearner):
             "phase",
             "epoch",
             "split",
-            "total_acc",
-            "old_acc",
-            "new_acc",
-            "total_count",
-            "old_count",
-            "new_count",
+            "disjoint_only_acc",
+            "blurry_exposed_acc",
             "loss",
             "lr",
             "known_classes",
@@ -480,39 +464,24 @@ class TagFex(BaseLearner):
             return
 
         train_metrics = self._accuracy_counts_to_metrics(train_counts)
-        base_row = {
+        row = {
             "task_id": self._cur_task,
             "phase": phase,
             "epoch": epoch + 1,
+            "split": "train",
             "loss": float(avg_loss),
             "lr": float(lr),
             "known_classes": self._known_classes,
             "total_classes": self._total_classes,
         }
-        train_row = dict(base_row)
-        train_row.update({"split": "train", **train_metrics})
-        self._append_accuracy_curve_row(train_row)
+        row.update(train_metrics)
+        self._append_accuracy_curve_row(row)
 
         metric_prefix = f"Task_{self._cur_task}/Diagnostics/{phase}"
         log_payload = {
-            f"{metric_prefix}/train_total_acc": train_metrics["total_acc"],
-            f"{metric_prefix}/train_old_acc": train_metrics["old_acc"],
-            f"{metric_prefix}/train_new_acc": train_metrics["new_acc"],
+            f"{metric_prefix}/train_disjoint_only_acc": train_metrics["disjoint_only_acc"],
+            f"{metric_prefix}/train_blurry_exposed_acc": train_metrics["blurry_exposed_acc"],
         }
-
-        if self._should_record_diagnostic_test(epoch, total_epochs):
-            test_metrics = self._eval_cnn_curve_metrics(test_loader)
-            test_row = dict(base_row)
-            test_row.update({"split": "test", **test_metrics})
-            self._append_accuracy_curve_row(test_row)
-            log_payload.update(
-                {
-                    f"{metric_prefix}/test_total_acc": test_metrics["total_acc"],
-                    f"{metric_prefix}/test_old_acc": test_metrics["old_acc"],
-                    f"{metric_prefix}/test_new_acc": test_metrics["new_acc"],
-                }
-            )
-
         log_payload = {key: value for key, value in log_payload.items() if value is not None}
         if log_payload:
             swanlab.log(log_payload, step=epoch + 1)
