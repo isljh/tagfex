@@ -142,7 +142,7 @@ def plot_all(results, save_name="pre_relu_comparison.png"):
 
 if __name__ == "__main__":
     print("开始初始化 DataManager...")
-    JSON_FILE = "exps/tagfex.json"
+    JSON_FILE = "exps/standard_cil/tagfex.json"
     dm = DataManager("imagenet100_aa", True, 1993, 10, 10, 1)
     print("DataManager 初始化完成")
 

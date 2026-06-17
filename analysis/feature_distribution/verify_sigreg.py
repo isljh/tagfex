@@ -83,7 +83,7 @@ def verify_gaussian_distribution(checkpoint_path, json_path, data_manager, save_
 
 
 if __name__ == "__main__":
-    JSON_FILE = "exps/tagfex.json"
+    JSON_FILE = "exps/standard_cil/tagfex.json"
     dm = DataManager("imagenet100_aa", True, 1993, 10, 10, 1)
     """
     # 加了 SIGReg 的 checkpoint

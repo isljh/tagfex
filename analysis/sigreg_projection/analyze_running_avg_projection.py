@@ -39,7 +39,7 @@ from analyze_fixed_projection import (
 )
 
 
-DEFAULT_CONFIG = "exps/tagfex_lejepa_mean_fusion_imagenet100_running_avg_matrix.json"
+DEFAULT_CONFIG = "exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_running_avg_matrix.json"
 DEFAULT_OUTPUT_DIR = "outputs/running_avg_projection_analysis"
 PROJECTION_METRICS = [
     "mean_abs_avg",

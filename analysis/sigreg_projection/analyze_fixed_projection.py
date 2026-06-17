@@ -7,6 +7,10 @@ import shlex
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -17,7 +21,7 @@ from utils.inc_net import TagFexNet
 
 EPSILON = 1e-8
 DEFAULT_HIST_DIRECTIONS = "0,1,2,3,4,5,10,20"
-DEFAULT_CONFIG = "exps/tagfex_lejepa_mean_fusion_imagenet100_fixed_matrix.json"
+DEFAULT_CONFIG = "exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_fixed_matrix.json"
 DEFAULT_OUTPUT_DIR = "outputs/fixed_projection_analysis"
 DEFAULT_NUM_DIRECTIONS = 256
 

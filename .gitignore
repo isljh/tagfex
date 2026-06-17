@@ -6,4 +6,4 @@ outputs/
 tagfex_logs/
 reference_flygcl/
 nohup.out
-analysis/
+analysis/oracle_nme/results/
