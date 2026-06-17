@@ -354,6 +354,26 @@ class TagFex(BaseLearner):
     def _record_accuracy_curves_enabled(self):
         return bool(self.args.get("record_accuracy_curves", False)) and self.args.get("local_rank", 0) <= 0
 
+    def _compute_sigreg_loss(self, embedding, num_items, num_views):
+        view_mode = self.args.get("sigreg_view_mode", "mixed")
+        if view_mode == "mixed":
+            return self.sig_reg(embedding)
+
+        proj = embedding.reshape(num_items, num_views, -1)
+        if view_mode == "view_wise":
+            losses = [self.sig_reg(proj[:, view_idx, :]) for view_idx in range(num_views)]
+            return torch.stack(losses).mean()
+
+        raise ValueError("Unknown sigreg_view_mode: {}".format(view_mode))
+
+    def _num_ts_views(self, num_views):
+        return min(int(self.args.get("num_ts_views", 2)), num_views)
+
+    def _select_ts_views(self, tensor, num_items, num_views, selected_views):
+        view_shape = (num_items, num_views) + tuple(tensor.shape[1:])
+        out_shape = (num_items * selected_views,) + tuple(tensor.shape[1:])
+        return tensor.reshape(view_shape)[:, :selected_views].reshape(out_shape)
+
     def _si_blurry_curve_class_sets(self):
         si_blurry_groups = self.args.get("si_blurry_eval_groups")
         if not si_blurry_groups:
@@ -534,6 +554,8 @@ class TagFex(BaseLearner):
 
         V_dim = self.args.get('num_views', 8)
         lamb = self.args.get('lejepa_lambda', 0.05)
+        ts_global_only = self.args.get("ts_global_only", False)
+        ts_views = self._num_ts_views(V_dim) if ts_global_only else V_dim
 
         # --- [关键：重置本阶段步数] ---
         batch_step = 0
@@ -575,14 +597,17 @@ class TagFex(BaseLearner):
                 inv_loss = (proj_mean - proj).square().mean()
 
                 # 2. 高斯正则化 (SIGReg)
-                sigreg_loss = self.sig_reg(embedding)
+                sigreg_loss = self._compute_sigreg_loss(embedding, N, V_dim)
 
                 # 3. 汇总
                 lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
 
                 # 4. 分类损失
-                y_rep = targets.repeat_interleave(V_dim)
-                ce_loss = F.cross_entropy(logits, y_rep)
+                y_rep = targets.repeat_interleave(ts_views)
+                logits_ts = logits
+                if ts_global_only:
+                    logits_ts = self._select_ts_views(logits, N, V_dim, ts_views)
+                ce_loss = F.cross_entropy(logits_ts, y_rep)
                 loss = ce_loss + lejepa_loss * self.args.get('contrast_factor', 1.0)
 
 
@@ -592,7 +617,7 @@ class TagFex(BaseLearner):
                 scheduler.step()
 
 
-                _, preds = torch.max(logits, dim=1)
+                _, preds = torch.max(logits_ts, dim=1)
                 batch_correct = preds.eq(y_rep).sum().item()
                 batch_total = y_rep.size(0)
                 batch_acc = (batch_correct * 100 / batch_total)
@@ -644,7 +669,11 @@ class TagFex(BaseLearner):
 
         V_dim = self.args.get('num_views', 8)
         lamb = self.args.get('lejepa_lambda', 0.05)
-        kd_global_only = self.args.get("kd_global_only", False)
+        ts_global_only = self.args.get("ts_global_only", False)
+        global_views = self._num_ts_views(V_dim)
+        ts_views = global_views if ts_global_only else V_dim
+        kd_global_only = self.args.get("kd_global_only", False) or ts_global_only
+        kd_views = global_views if kd_global_only else V_dim
 
         task_prefix = f"Task_{self._cur_task}"
         batch_step = 0
@@ -669,18 +698,23 @@ class TagFex(BaseLearner):
                 proj = embedding.reshape(N, V_dim, -1)
                 proj_mean = proj.mean(1, keepdim=True)
                 inv_loss = (proj_mean - proj).square().mean()
-                sigreg_loss = self.sig_reg(embedding)
+                sigreg_loss = self._compute_sigreg_loss(embedding, N, V_dim)
                 lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
 
                 # --- [分类与增量损失] ---
-                y_rep = targets.repeat_interleave(V_dim)
-                loss_clf = F.cross_entropy(logits, y_rep)
+                y_rep = targets.repeat_interleave(ts_views)
+                logits_ts = logits
+                aux_logits_ts = aux_logits
+                if ts_global_only:
+                    logits_ts = self._select_ts_views(logits, N, V_dim, ts_views)
+                    aux_logits_ts = self._select_ts_views(aux_logits, N, V_dim, ts_views)
+                loss_clf = F.cross_entropy(logits_ts, y_rep)
 
                 # Aux Loss
                 aux_targets = y_rep.clone()
                 aux_targets = torch.where(aux_targets - self._known_classes + 1 > 0,
                                           aux_targets - self._known_classes + 1, 0)
-                loss_aux = F.cross_entropy(aux_logits, aux_targets)
+                loss_aux = F.cross_entropy(aux_logits_ts, aux_targets)
 
                 # Distill Loss
                 predicted_feature = outputs['predicted_feature']  # [N*V, Dim]
@@ -690,8 +724,8 @@ class TagFex(BaseLearner):
 
                 if kd_global_only:
                     # LeJEPA 仍使用全部 8 个视图进行自监督；仅将 KD 约束限制在前两个 global views。
-                    predicted_feature = predicted_feature.reshape(N, V_dim, -1)[:, :2, :].reshape(N * 2, -1)
-                    old_ta_feature = old_ta_feature.reshape(N, V_dim, -1)[:, :2, :].reshape(N * 2, -1)
+                    predicted_feature = predicted_feature.reshape(N, V_dim, -1)[:, :kd_views, :].reshape(N * kd_views, -1)
+                    old_ta_feature = old_ta_feature.reshape(N, V_dim, -1)[:, :kd_views, :].reshape(N * kd_views, -1)
 
                 z_target = self.last_projector(old_ta_feature)
                 p_pred = self.last_projector(predicted_feature)
@@ -699,6 +733,8 @@ class TagFex(BaseLearner):
 
                 # Transfer Loss
                 trans_logits = outputs["trans_logits"]
+                if ts_global_only:
+                    trans_logits = self._select_ts_views(trans_logits, N, V_dim, ts_views)
                 cur_task_mask = (y_rep >= self._known_classes)
                 # trans_cls_loss = F.cross_entropy(trans_logits[cur_task_mask],targets[cur_task_mask] - self._known_classes)
                 y_rep_new = y_rep - self._known_classes  # 偏移标签
@@ -707,7 +743,7 @@ class TagFex(BaseLearner):
                 if trans_cls_loss < loss_clf:
                     temp_T = self.args['kd_temp']
                     transfer_loss = F.kl_div(
-                        (logits[cur_task_mask][:, self._known_classes:] / temp_T).log_softmax(dim=1),
+                        (logits_ts[cur_task_mask][:, self._known_classes:] / temp_T).log_softmax(dim=1),
                         (trans_logits.detach()[cur_task_mask] / temp_T).softmax(dim=1), reduction='batchmean')
                 else:
                     transfer_loss = torch.tensor(0., device=self._device)
@@ -728,7 +764,7 @@ class TagFex(BaseLearner):
                 losses += loss.item()
                 losses_aux += loss_aux.item()
                 losses_clf += loss_clf.item()
-                _, preds = torch.max(logits, dim=1)
+                _, preds = torch.max(logits_ts, dim=1)
                 batch_acc = preds.eq(y_rep).sum().item() * 100.0 / y_rep.size(0)
                 correct += preds.eq(y_rep).cpu().sum()
                 total += len(y_rep)

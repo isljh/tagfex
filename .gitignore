@@ -7,3 +7,5 @@ tagfex_logs/
 reference_flygcl/
 nohup.out
 analysis/oracle_nme/results/
+swanlog/
+analysis/sigreg_projection/process_outputs/
