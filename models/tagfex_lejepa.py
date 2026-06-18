@@ -366,6 +366,31 @@ class TagFex(BaseLearner):
 
         raise ValueError("Unknown sigreg_view_mode: {}".format(view_mode))
 
+    def _compute_selfsup_losses(self, embedding, num_items, num_views, lamb):
+        selfsup_mode = self.args.get("selfsup_mode", "lejepa")
+        zero = embedding.new_zeros(())
+        if selfsup_mode == "none":
+            return zero, zero, zero
+
+        proj = embedding.reshape(num_items, num_views, -1)
+        proj_mean = proj.mean(1, keepdim=True)
+
+        if selfsup_mode == "lejepa":
+            inv_loss = (proj_mean - proj).square().mean()
+            sigreg_loss = self._compute_sigreg_loss(embedding, num_items, num_views)
+            selfsup_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
+            return inv_loss, sigreg_loss, selfsup_loss
+
+        if selfsup_mode == "inv_only":
+            inv_loss = (proj_mean - proj).square().mean()
+            return inv_loss, zero, inv_loss
+
+        if selfsup_mode == "sigreg_only":
+            sigreg_loss = self._compute_sigreg_loss(embedding, num_items, num_views)
+            return zero, sigreg_loss, sigreg_loss
+
+        raise ValueError("Unknown selfsup_mode: {}".format(selfsup_mode))
+
     def _num_ts_views(self, num_views):
         return min(int(self.args.get("num_ts_views", 2)), num_views)
 
@@ -590,17 +615,10 @@ class TagFex(BaseLearner):
                 out = self._network(vs.flatten(0, 1))
                 logits, embedding = out["logits"], out["embedding"]
 
-                # --- [LeJEPA 损失计算] ---
-                # 1. 不变性损失 (Invariance)
-                proj = embedding.reshape(N, V_dim, -1)
-                proj_mean = proj.mean(1, keepdim=True)
-                inv_loss = (proj_mean - proj).square().mean()
-
-                # 2. 高斯正则化 (SIGReg)
-                sigreg_loss = self._compute_sigreg_loss(embedding, N, V_dim)
-
-                # 3. 汇总
-                lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
+                # --- [LeJEPA / self-supervised loss] ---
+                inv_loss, sigreg_loss, lejepa_loss = self._compute_selfsup_losses(
+                    embedding, N, V_dim, lamb
+                )
 
                 # 4. 分类损失
                 y_rep = targets.repeat_interleave(ts_views)
@@ -694,12 +712,10 @@ class TagFex(BaseLearner):
                 logits, aux_logits = outputs["logits"], outputs["aux_logits"]
                 embedding = outputs['embedding']
 
-                # --- [LeJEPA 损失] ---
-                proj = embedding.reshape(N, V_dim, -1)
-                proj_mean = proj.mean(1, keepdim=True)
-                inv_loss = (proj_mean - proj).square().mean()
-                sigreg_loss = self._compute_sigreg_loss(embedding, N, V_dim)
-                lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
+                # --- [LeJEPA / self-supervised loss] ---
+                inv_loss, sigreg_loss, lejepa_loss = self._compute_selfsup_losses(
+                    embedding, N, V_dim, lamb
+                )
 
                 # --- [分类与增量损失] ---
                 y_rep = targets.repeat_interleave(ts_views)
