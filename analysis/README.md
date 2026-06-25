@@ -7,11 +7,79 @@
 ```text
 oracle_nme/            TA 特征或 projector embedding 的 Oracle NME 上界分析
 sigreg_projection/     SIGReg 投影矩阵与 embedding 高斯性诊断
+classifier_calibration/ 已训练特征上的主分类器重新初始化与只微调诊断
 feature_distribution/  早期 embedding / Pre-ReLU 特征分布可视化
 ideas/                 暂未验证的未来研究想法
 ```
 
 每个子目录都有自己的 `README.md`，说明该分析任务的目标、脚本和典型用法。
+
+
+## 2026-06-18：Class Mean 初始化分类器诊断
+
+### 修改目的
+
+老师指出 TagFex 主分类器随 task 增加会不断扩展输入维度，大量新增权重区域是随机初始化的，旧类又只有少量 replay 样本，可能导致分类器训练不足。
+
+当前先做一个事后诊断，而不是直接改训练流程：在已经训练好的 Task1+ feature extractor 上，冻结 TS / TA / projector 等模块，只重新初始化并微调主分类器 `fc`，比较 random init 和 class mean init 的差异。
+
+### 当前文件
+
+- `classifier_calibration/class_mean_fc_finetune.py`：读取 checkpoint，比较 original fc、random reinit + fc-only finetune、class mean init + fc-only finetune。
+
+### 使用示例
+
+建议至少跑两组超参，并使用不同 `--output-dir`，避免结果互相覆盖。
+
+### 设置 A：fc-only 快速诊断
+
+```bash
+python analysis/classifier_calibration/class_mean_fc_finetune.py \
+  --config exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_final_sigreg.json \
+  --checkpoint /root/autodl-tmp/tagfex_logs/ablation_lejepa_mean_fusion_final_sigreg/imagenet100_lejepa/0/10/20260603_201153/checkpoints/ablation_lejepa_mean_fusion_final_sigreg_1993_task_1.pth \
+  --device 0 \
+  --epochs 30 \
+  --lr 1e-3 \
+  --weight-decay 0 \
+  --output-dir analysis/classifier_calibration/results/ablation_lejepa_mean_fusion_final_sigreg_task1_lr1e-3_wd0
+```
+
+### 设置 B：LeJEPA-aligned
+
+LeJEPA 版本原训练使用 AdamW，`lr=5e-4`，`weight_decay=5e-4`。因此这组更贴近原训练设定。
+
+```bash
+python analysis/classifier_calibration/class_mean_fc_finetune.py \
+  --config exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_final_sigreg.json \
+  --checkpoint /root/autodl-tmp/tagfex_logs/ablation_lejepa_mean_fusion_final_sigreg/imagenet100_lejepa/0/10/20260603_201153/checkpoints/ablation_lejepa_mean_fusion_final_sigreg_1993_task_1.pth \
+  --device 0 \
+  --epochs 30 \
+  --lr 5e-4 \
+  --weight-decay 5e-4 \
+  --output-dir analysis/classifier_calibration/results/ablation_lejepa_mean_fusion_final_sigreg_task1_lr5e-4_wd5e-4
+```
+
+### 当前已跑的混合设置
+
+如果要复现当前 `ablation_lejepa_mean_fusion_final_sigreg_task1` 结果目录中的配置，使用：
+
+```bash
+python analysis/classifier_calibration/class_mean_fc_finetune.py \
+  --config exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_final_sigreg.json \
+  --checkpoint /root/autodl-tmp/tagfex_logs/ablation_lejepa_mean_fusion_final_sigreg/imagenet100_lejepa/0/10/20260603_201153/checkpoints/ablation_lejepa_mean_fusion_final_sigreg_1993_task_1.pth \
+  --device 0 \
+  --epochs 30 \
+  --lr 1e-3 \
+  --weight-decay 5e-4 \
+  --output-dir analysis/classifier_calibration/results/ablation_lejepa_mean_fusion_final_sigreg_task1
+```
+
+## 结果解释
+
+- `random > original`：说明额外只微调分类器可能有帮助。
+- `class_mean > random`：说明 class mean 初始化本身有帮助。
+- `class_mean ~= random > original`：主要收益可能来自 fc-only finetune，不一定来自 class mean。
+- 两个 finetune 分支都不如 original：说明冻结特征后重训 fc 不容易，原始联合训练得到的 fc 更好。
 
 ## 2026-06-15：TA 特征 Oracle NME 上界分析
 
@@ -72,7 +140,7 @@ ideas/                 暂未验证的未来研究想法
 
 ```bash
 python analysis/oracle_nme/ta_oracle_nme.py \
-  --config exps/si_blurry/si_blurry_tagfex_lejepa_imagenet100_final_sigreg.json \
+  --config exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_final_sigreg.json \
   --checkpoint /path/to/checkpoint_task_0.pkl \
   --feature ta_feature \
   --device 0
@@ -82,7 +150,7 @@ python analysis/oracle_nme/ta_oracle_nme.py \
 
 ```bash
 python analysis/oracle_nme/ta_oracle_nme.py \
-  --config exps/si_blurry/si_blurry_tagfex_lejepa_imagenet100_final_sigreg.json \
+  --config exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_final_sigreg.json \
   --checkpoint /path/to/checkpoint_task_0.pkl \
   --feature embedding \
   --device 0
@@ -92,7 +160,7 @@ python analysis/oracle_nme/ta_oracle_nme.py \
 
 ```bash
 python analysis/oracle_nme/ta_oracle_nme.py \
-  --config exps/si_blurry/si_blurry_tagfex_lejepa_imagenet100_final_sigreg.json \
+  --config exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_final_sigreg.json \
   --checkpoint /path/to/checkpoint_task_0.pkl \
   --feature ta_feature \
   --device 0 \
@@ -113,7 +181,7 @@ Checkpoint：
 配置文件：
 
 ```text
-exps/si_blurry/si_blurry_tagfex_lejepa_imagenet100_final_sigreg.json
+exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_final_sigreg.json
 ```
 
 ### 重要说明

@@ -98,6 +98,8 @@ python -m json.tool exps/lejepa_fixes/tagfex_lejepa_mean_fusion_view_wise_sigreg
 
 两项检查均通过。
 CUDA_VISIBLE_DEVICES=0 python main.py --config exps/lejepa_fixes/tagfex_lejepa_mean_fusion_view_wise_sigreg.json
+消融ta
+CUDA_VISIBLE_DEVICES=0 python main.py --config exps/lejepa_fixes/tagfex_lejepa_mean_fusion_no_selfsup.json
 ## 备注
 
 - `sigreg_view_mode` 默认值是 `mixed`，所以旧配置不设置该字段时仍保持原行为。

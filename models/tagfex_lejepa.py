@@ -296,6 +296,17 @@ class TagFex(BaseLearner):
             appendent=self._get_memory(),
         )
 
+        if self.args.get("class_mean_fc_init", False):
+            init_loader = DataLoader(
+                train_dataset,
+                batch_size=current_batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=False,
+            )
+            self._init_fc_with_class_means(init_loader)
+
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if is_distributed else None
         self.train_loader = DataLoader(
             train_dataset, batch_size=current_batch_size,
@@ -530,6 +541,131 @@ class TagFex(BaseLearner):
         log_payload = {key: value for key, value in log_payload.items() if value is not None}
         if log_payload:
             swanlab.log(log_payload, step=epoch + 1)
+
+    def _flatten_augmented_inputs(self, inputs, targets):
+        if inputs.ndim == 5:
+            return inputs.flatten(0, 1), targets.repeat_interleave(inputs.shape[1])
+        return inputs, targets
+
+    def _compute_class_mean_fc_weights(self, features, targets, reference_weight, scale_mode):
+        norm_features = features.float() / features.float().norm(p=2, dim=1, keepdim=True).clamp_min(EPSILON)
+        num_classes = int(self._total_classes)
+        class_means = torch.zeros(num_classes, features.shape[1], dtype=torch.float32)
+        counts = torch.zeros(num_classes, dtype=torch.long)
+        missing = []
+
+        for class_idx in range(num_classes):
+            mask = targets == class_idx
+            counts[class_idx] = int(mask.sum())
+            if counts[class_idx] == 0:
+                missing.append(class_idx)
+                continue
+            mean = norm_features[mask].mean(dim=0)
+            class_means[class_idx] = mean / mean.norm(p=2).clamp_min(EPSILON)
+
+        if missing:
+            raise ValueError("No samples for class_mean_fc_init classes: {}".format(missing))
+
+        if scale_mode == "none":
+            return class_means, counts
+        if scale_mode == "global_weight_norm":
+            scale = reference_weight.detach().float().norm(p=2, dim=1).mean()
+            return class_means * scale, counts
+        if scale_mode == "per_class_weight_norm":
+            scales = reference_weight.detach().float().norm(p=2, dim=1).clamp_min(EPSILON)
+            return class_means * scales[:, None], counts
+        raise ValueError("Unknown class_mean_fc_init_scale: {}".format(scale_mode))
+
+    def _apply_class_mean_fc_init(self, ptr, class_mean_weights):
+        mode = self.args.get("class_mean_fc_init_mode", "partial_new_regions")
+        bias_mode = self.args.get("class_mean_fc_init_bias", "zero")
+        old_classes = int(self._known_classes)
+        total_classes = int(self._total_classes)
+        old_feature_dim = ptr.feature_dim - ptr.out_dim
+
+        with torch.no_grad():
+            if mode == "partial_new_regions":
+                if old_classes > 0 and old_feature_dim > 0:
+                    ptr.fc.weight[:old_classes, old_feature_dim:] = class_mean_weights[:old_classes, old_feature_dim:]
+                ptr.fc.weight[old_classes:total_classes, :] = class_mean_weights[old_classes:total_classes, :]
+                bias_slice = slice(0, total_classes)
+            elif mode == "all_seen":
+                ptr.fc.weight[:total_classes, :] = class_mean_weights[:total_classes, :]
+                bias_slice = slice(0, total_classes)
+            elif mode == "new_classes":
+                ptr.fc.weight[old_classes:total_classes, :] = class_mean_weights[old_classes:total_classes, :]
+                bias_slice = slice(old_classes, total_classes)
+            else:
+                raise ValueError("Unknown class_mean_fc_init_mode: {}".format(mode))
+
+            if ptr.fc.bias is not None:
+                if bias_mode == "zero":
+                    ptr.fc.bias[bias_slice].zero_()
+                elif bias_mode == "keep":
+                    pass
+                else:
+                    raise ValueError("Unknown class_mean_fc_init_bias: {}".format(bias_mode))
+
+    def _init_fc_with_class_means(self, init_loader):
+        if self._cur_task == 0:
+            return
+
+        ptr = self._network.module if hasattr(self._network, "module") else self._network
+        local_rank = self.args.get("local_rank", 0)
+        distributed_ready = dist.is_available() and dist.is_initialized()
+        should_compute = (not distributed_ready) or dist.get_rank() == 0
+        if local_rank <= 0:
+            logging.info(
+                "Running class_mean_fc_init before Task {} training: mode={}, scale={}, bias={}".format(
+                    self._cur_task,
+                    self.args.get("class_mean_fc_init_mode", "partial_new_regions"),
+                    self.args.get("class_mean_fc_init_scale", "global_weight_norm"),
+                    self.args.get("class_mean_fc_init_bias", "zero"),
+                )
+            )
+
+        was_training = ptr.training
+        ptr.to(self._device)
+        ptr.eval()
+
+        if should_compute:
+            features, targets = [], []
+            with torch.no_grad():
+                for batch in tqdm(init_loader, desc="Class mean fc init", dynamic_ncols=True, disable=local_rank > 0):
+                    inputs = batch[1].to(self._device, non_blocking=True)
+                    batch_targets = batch[-1].to(self._device, non_blocking=True)
+                    inputs, batch_targets = self._flatten_augmented_inputs(inputs, batch_targets)
+                    outputs = ptr(inputs)
+                    features.append(outputs["features"].detach().cpu())
+                    targets.append(batch_targets.detach().cpu())
+
+            features = torch.cat(features, dim=0)
+            targets = torch.cat(targets, dim=0)
+            reference_weight = ptr.fc.weight.detach().cpu().clone()
+            class_mean_weights, counts = self._compute_class_mean_fc_weights(
+                features,
+                targets,
+                reference_weight,
+                self.args.get("class_mean_fc_init_scale", "global_weight_norm"),
+            )
+            self._apply_class_mean_fc_init(ptr, class_mean_weights.to(self._device))
+
+            if local_rank <= 0:
+                old_counts = counts[: self._known_classes].tolist()
+                new_counts = counts[self._known_classes : self._total_classes].tolist()
+                logging.info(
+                    "class_mean_fc_init sample counts: old_classes={}, new_classes={}".format(
+                        old_counts, new_counts
+                    )
+                )
+
+        if distributed_ready:
+            dist.broadcast(ptr.fc.weight.data, src=0)
+            if ptr.fc.bias is not None:
+                dist.broadcast(ptr.fc.bias.data, src=0)
+
+        if was_training:
+            ptr.train()
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
