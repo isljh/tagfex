@@ -165,6 +165,8 @@ class TagFex(BaseLearner):
         self._sigreg_task_matrix_states = {}
         self._pending_rehearsal_memory_build = False
         self._final_sigreg_last_state = None
+        self.linear_probe = None
+        self.linear_probe_optimizer = None
 
         # --- SwanLab 初始化 ---
         local_rank = self.args.get("local_rank", 0)
@@ -197,6 +199,55 @@ class TagFex(BaseLearner):
                         self._cur_task, matrix_seed
                     )
                 )
+
+    def _init_task0_online_probe(self, feature_dim, num_classes):
+        if not self.args.get("online_linear_probe", False):
+            return
+        if self._cur_task != 0 or self.linear_probe is not None:
+            return
+        if num_classes <= 0:
+            raise ValueError("online_linear_probe requires a positive Task0 class count.")
+
+        self.linear_probe = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, num_classes),
+        ).to(self._device)
+        self.linear_probe_optimizer = torch.optim.AdamW(
+            self.linear_probe.parameters(),
+            lr=self.args.get("probe_lr", 1e-3),
+            weight_decay=self.args.get("probe_weight_decay", 1e-6),
+        )
+
+    def _update_task0_online_probe(self, features, targets):
+        if not self.args.get("online_linear_probe", False):
+            return {}
+        if self._cur_task != 0:
+            return {}
+        if features.size(0) != targets.size(0):
+            raise ValueError(
+                "online_linear_probe feature/target mismatch: {} vs {}".format(
+                    features.size(0), targets.size(0)
+                )
+            )
+
+        if self.linear_probe is None:
+            self._init_task0_online_probe(features.size(1), int(self._total_classes))
+
+        self.linear_probe.train()
+        probe_features = features.detach().float()
+        probe_targets = targets.detach().long()
+        logits = self.linear_probe(probe_features)
+        probe_loss = F.cross_entropy(logits, probe_targets)
+
+        self.linear_probe_optimizer.zero_grad()
+        probe_loss.backward()
+        self.linear_probe_optimizer.step()
+
+        probe_top1 = (logits.argmax(dim=1) == probe_targets).float().mean().item() * 100
+        return {
+            "probe_loss": probe_loss.item(),
+            "probe_top1": probe_top1,
+        }
 
     def _record_sigreg_task_state(self, state):
         if state.get("matrix_mode") != "running_avg" or state.get("running_A") is None:
@@ -544,7 +595,8 @@ class TagFex(BaseLearner):
 
     def _flatten_augmented_inputs(self, inputs, targets):
         if inputs.ndim == 5:
-            return inputs.flatten(0, 1), targets.repeat_interleave(inputs.shape[1])
+            num_views = inputs.shape[1]
+            return inputs.flatten(0, 1), targets.repeat_interleave(num_views)
         return inputs, targets
 
     def _compute_class_mean_fc_weights(self, features, targets, reference_weight, scale_mode):
@@ -770,6 +822,8 @@ class TagFex(BaseLearner):
                 optimizer.step()
                 scheduler.step()
 
+                probe_targets = targets.repeat_interleave(V_dim)
+                probe_log = self._update_task0_online_probe(embedding, probe_targets)
 
                 _, preds = torch.max(logits_ts, dim=1)
                 batch_correct = preds.eq(y_rep).sum().item()
@@ -780,7 +834,7 @@ class TagFex(BaseLearner):
                 if local_rank <= 0:
                     # SwanLab 默认会自动累计 step，直接 log 即可。
                     # 如果你想跨 Task 保持步数连续，可以传入 step=self.global_step
-                    swanlab.log({
+                    log_payload = {
                         "init/total_loss": loss.item(),
                         "init/batch_acc": batch_acc,
                         "init/Prediction_Invariance_loss": inv_loss.item(),
@@ -788,7 +842,13 @@ class TagFex(BaseLearner):
                         "init/LeJEPA_total_loss": lejepa_loss.item(),
                         "init/ce_loss": ce_loss.item(),
                         "init/lr": optimizer.param_groups[0]['lr'],
-                    }, step=batch_step)
+                    }
+                    if probe_log:
+                        log_payload.update({
+                            "init/probe_loss": probe_log["probe_loss"],
+                            "init/probe_top1": probe_log["probe_top1"],
+                        })
+                    swanlab.log(log_payload, step=batch_step)
                     batch_step += 1
 
                 losses += loss.item()

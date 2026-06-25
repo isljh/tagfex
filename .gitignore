@@ -10,3 +10,4 @@ analysis/oracle_nme/results/
 swanlog/
 analysis/sigreg_projection/process_outputs/
 analysis/classifier_calibration/results/
+reference_repos/
