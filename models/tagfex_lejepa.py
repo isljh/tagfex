@@ -249,6 +249,37 @@ class TagFex(BaseLearner):
             "probe_top1": probe_top1,
         }
 
+    def get_online_probe_state(self):
+        if self.linear_probe is None:
+            return None
+        linear = self.linear_probe[-1]
+        return {
+            "enabled": bool(self.args.get("online_linear_probe", False)),
+            "probe_feature": self.args.get("probe_feature", "ta_feature"),
+            "task_id": int(self._cur_task),
+            "feature_dim": int(linear.in_features),
+            "num_classes": int(linear.out_features),
+            "probe_state_dict": self.linear_probe.state_dict(),
+            "probe_optimizer_state_dict": (
+                self.linear_probe_optimizer.state_dict()
+                if self.linear_probe_optimizer is not None
+                else None
+            ),
+        }
+
+    def load_online_probe_state(self, state):
+        if not state:
+            return False
+        self._init_task0_online_probe(
+            int(state["feature_dim"]),
+            int(state["num_classes"]),
+        )
+        self.linear_probe.load_state_dict(state["probe_state_dict"])
+        optimizer_state = state.get("probe_optimizer_state_dict")
+        if optimizer_state is not None and self.linear_probe_optimizer is not None:
+            self.linear_probe_optimizer.load_state_dict(optimizer_state)
+        return True
+
     def _record_sigreg_task_state(self, state):
         if state.get("matrix_mode") != "running_avg" or state.get("running_A") is None:
             return
@@ -802,6 +833,10 @@ class TagFex(BaseLearner):
                 # --- [前向传播] ---
                 out = self._network(vs.flatten(0, 1))
                 logits, embedding = out["logits"], out["embedding"]
+                probe_feature_name = self.args.get("probe_feature", "ta_feature")
+                if probe_feature_name not in out:
+                    raise ValueError("Unknown probe_feature: {}".format(probe_feature_name))
+                probe_features = out[probe_feature_name]
 
                 # --- [LeJEPA / self-supervised loss] ---
                 inv_loss, sigreg_loss, lejepa_loss = self._compute_selfsup_losses(
@@ -823,7 +858,7 @@ class TagFex(BaseLearner):
                 scheduler.step()
 
                 probe_targets = targets.repeat_interleave(V_dim)
-                probe_log = self._update_task0_online_probe(embedding, probe_targets)
+                probe_log = self._update_task0_online_probe(probe_features, probe_targets)
 
                 _, preds = torch.max(logits_ts, dim=1)
                 batch_correct = preds.eq(y_rep).sum().item()

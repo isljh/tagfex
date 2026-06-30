@@ -1,13 +1,13 @@
 {
-    "prefix": "ablation_lejepa_mean_fusion_online_probe",
-    "dataset": "imagenet100_lejepa",
+    "prefix": "tagfex_imagenet100_online_probe",
+    "dataset": "imagenet100_aa",
     "memory_size": 2000,
     "memory_per_class": 20,
     "fixed_memory": false,
     "shuffle": true,
     "init_cls": 10,
     "increment": 10,
-    "model_name": "tagfex_lejepa",
+    "model_name": "tagfex",
     "convnet_type": "resnet18",
     "device": [
         "0"
@@ -28,14 +28,12 @@
     "transfer_factor": 1,
     "aux_factor": 2,
     "contrast_kd_factor": 2,
-    "aug": 1,
-    "num_views": 8,
+    "aug": 2,
+    "num_views": 2,
     "lejepa_lambda": 0.05,
-    "is_distributed": true,
-    "fusion_type": "mean",
-    "kd_global_only": true,
+    "is_distributed": false,
     "online_linear_probe": true,
     "probe_lr": 0.001,
     "probe_weight_decay": 1e-07,
-    "probe_feature": "ta_feature"
+    "fusion_type": "mean"
 }

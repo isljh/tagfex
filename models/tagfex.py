@@ -38,6 +38,8 @@ class TagFex(BaseLearner):
         super().__init__(args)
         self._network = TagFexNet(args, False)
         self._global_step = 0
+        self.linear_probe = None
+        self.linear_probe_optimizer = None
 
         local_rank = self.args.get("local_rank", 0)
         if local_rank <= 0:
@@ -51,6 +53,86 @@ class TagFex(BaseLearner):
                 config=self.args,
                 suffix="timestamp",
             )
+
+    def _init_task0_online_probe(self, feature_dim, num_classes):
+        if not self.args.get("online_linear_probe", False):
+            return
+        if self._cur_task != 0 or self.linear_probe is not None:
+            return
+        if num_classes <= 0:
+            raise ValueError("online_linear_probe requires a positive Task0 class count.")
+
+        self.linear_probe = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, num_classes),
+        ).to(self._device)
+        self.linear_probe_optimizer = torch.optim.AdamW(
+            self.linear_probe.parameters(),
+            lr=self.args.get("probe_lr", 1e-3),
+            weight_decay=self.args.get("probe_weight_decay", 1e-7),
+        )
+
+    def _update_task0_online_probe(self, features, targets):
+        if not self.args.get("online_linear_probe", False):
+            return {}
+        if self._cur_task != 0:
+            return {}
+        if features.size(0) != targets.size(0):
+            raise ValueError(
+                "online_linear_probe feature/target mismatch: {} vs {}".format(
+                    features.size(0), targets.size(0)
+                )
+            )
+
+        if self.linear_probe is None:
+            self._init_task0_online_probe(features.size(1), int(self._total_classes))
+
+        self.linear_probe.train()
+        probe_features = features.detach().float()
+        probe_targets = targets.detach().long()
+        logits = self.linear_probe(probe_features)
+        probe_loss = F.cross_entropy(logits, probe_targets)
+
+        self.linear_probe_optimizer.zero_grad()
+        probe_loss.backward()
+        self.linear_probe_optimizer.step()
+
+        probe_top1 = (logits.argmax(dim=1) == probe_targets).float().mean().item() * 100
+        return {
+            "probe_loss": probe_loss.item(),
+            "probe_top1": probe_top1,
+        }
+
+    def get_online_probe_state(self):
+        if self.linear_probe is None:
+            return None
+        linear = self.linear_probe[-1]
+        return {
+            "enabled": bool(self.args.get("online_linear_probe", False)),
+            "probe_feature": self.args.get("probe_feature", "embedding"),
+            "task_id": int(self._cur_task),
+            "feature_dim": int(linear.in_features),
+            "num_classes": int(linear.out_features),
+            "probe_state_dict": self.linear_probe.state_dict(),
+            "probe_optimizer_state_dict": (
+                self.linear_probe_optimizer.state_dict()
+                if self.linear_probe_optimizer is not None
+                else None
+            ),
+        }
+
+    def load_online_probe_state(self, state):
+        if not state:
+            return False
+        self._init_task0_online_probe(
+            int(state["feature_dim"]),
+            int(state["num_classes"]),
+        )
+        self.linear_probe.load_state_dict(state["probe_state_dict"])
+        optimizer_state = state.get("probe_optimizer_state_dict")
+        if optimizer_state is not None and self.linear_probe_optimizer is not None:
+            self.linear_probe_optimizer.load_state_dict(optimizer_state)
+        return True
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -244,6 +326,7 @@ class TagFex(BaseLearner):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                probe_log = self._update_task0_online_probe(embedding, targets)
                 losses += loss.item()
 
                 _, preds = torch.max(logits, dim=1)
@@ -255,16 +338,19 @@ class TagFex(BaseLearner):
                     batch_acc = np.around(
                         tensor2numpy(batch_correct) * 100 / len(targets), decimals=2
                     )
-                    swanlab.log(
-                        {
-                            "init/total_loss": loss.item(),
-                            "init/ce_loss": ce_loss.item(),
-                            "init/infonce_loss": infonce_loss.item(),
-                            "init/batch_acc": batch_acc,
-                            "init/epoch": epoch,
-                        },
-                        step=self._global_step,
-                    )
+                    log_payload = {
+                        "init/total_loss": loss.item(),
+                        "init/ce_loss": ce_loss.item(),
+                        "init/infonce_loss": infonce_loss.item(),
+                        "init/batch_acc": batch_acc,
+                        "init/epoch": epoch,
+                    }
+                    if probe_log:
+                        log_payload.update({
+                            "init/probe_loss": probe_log["probe_loss"],
+                            "init/probe_top1": probe_log["probe_top1"],
+                        })
+                    swanlab.log(log_payload, step=self._global_step)
                     self._global_step += 1
 
             scheduler.step()

@@ -1,0 +1,17 @@
+{
+    "config": "exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_online_probe.json",
+    "checkpoint": "logs/ablation_lejepa_mean_fusion_online_probe/imagenet100_lejepa/0/10/20260625_181747/checkpoints/ablation_lejepa_mean_fusion_online_probe_1993_task_0.pth",
+    "output_dir": "analysis/task0_selfsup_continue/results/ablation_lejepa_mean_fusion_online_probe_task0_extra_lr2e-4_ep50",
+    "device": "0",
+    "epochs": 50,
+    "batch_size": 64,
+    "num_workers": 16,
+    "lr": 0.0002,
+    "weight_decay": 0.0005,
+    "loss_factor": 1.0,
+    "probe_lr": 0.001,
+    "probe_weight_decay": 1e-07,
+    "swanlab_project": "PyCIL_TagFex",
+    "swanlab_name": "ablation_lejepa_mean_fusion_online_probe_task0_selfsup_continue_lr2e-4_ep50",
+    "probe_feature": "ta_feature"
+}

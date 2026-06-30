@@ -11,3 +11,5 @@ swanlog/
 analysis/sigreg_projection/process_outputs/
 analysis/classifier_calibration/results/
 reference_repos/
+analysis/task0_selfsup_continue/results/
+analysis/online_probe/results/

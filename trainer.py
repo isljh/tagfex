@@ -553,6 +553,9 @@ def _save_resume_checkpoint(model, save_path, task, history_state=None, extra_st
         "class_means": getattr(model, "_class_means", None),
         "sigreg_state": model.get_sigreg_state() if hasattr(model, "get_sigreg_state") else None,
         "final_sigreg_state": final_sigreg_state,
+        "online_probe_state": (
+            model.get_online_probe_state() if hasattr(model, "get_online_probe_state") else None
+        ),
         "cnn_curve": history_state.get("cnn_curve", {"top1": [], "top5": []}),
         "nme_curve": history_state.get("nme_curve", {"top1": [], "top5": []}),
         "cnn_matrix": history_state.get("cnn_matrix", []),
@@ -902,6 +905,14 @@ def _resume_from_checkpoint(model, data_manager, resume_path):
                 logging.info("Loaded SIGReg matrix state from checkpoint.")
         else:
             logging.warning("Checkpoint does not contain SIGReg matrix state; SIGReg matrix will be reinitialized.")
+
+    online_probe_state = ckpt.get("online_probe_state", None)
+    if hasattr(model, "load_online_probe_state"):
+        if online_probe_state is not None:
+            if model.load_online_probe_state(online_probe_state):
+                logging.info("Loaded online linear probe state from checkpoint.")
+        elif model.args.get("online_linear_probe", False):
+            logging.warning("Checkpoint does not contain online linear probe state; probe will be reinitialized if used.")
 
     _restore_rng_state(ckpt.get("rng_state"))
 

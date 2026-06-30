@@ -674,3 +674,178 @@ TS 分类/aux/transfer: 使用 2 个 global views
 
 > 我自己发现，当前 LeJEPA 版本相对原版 TagFex 同时改变了两个因素：一是 SIGReg 从 view-wise distribution 变成了所有 view 混合后的整体分布；二是训练输入从两个增强视图变成 8 个 views，并且这 8 个 views 都进入 TS 分类分支参与分类、aux 和 transfer 等监督损失。因此需要先做接入修正实验：将 SIGReg 改回 view-wise 形式，并测试 LeJEPA 自监督使用 8 views、但 TS 分类损失只使用前两个 global views 的版本。这样才能判断当前性能问题到底来自 LeJEPA 方法本身，还是来自接入方式改变了原版 TagFex 的训练分布。
 
+## Standalone TA-LeJEPA 诊断实验
+
+### 背景
+
+当前在线线性探测器结果显示，TagFex-LeJEPA 的 Task0 训练 200 epoch 后，`ta_feature` 的 epoch 内 batch 平均 probe top1 约为 74.16%。在冻结 TagFex 其他模块、只继续训练 TA encoder 和 projector 后，probe top1 还能继续上升到 75% 以上。
+
+这说明两个问题：
+
+1. LeJEPA 自监督分支在原始 Task0 训练结束时还没有完全收敛。
+2. 延长 TA-LeJEPA 训练对表示线性可分性有正向作用，但目前提升速度较慢。
+
+不过，继续训练实验是从已经经过 TagFex 联合训练的 Task0 checkpoint 出发，仍然会受到前期训练状态影响。它可以说明“继续训练有用”，但不能干净回答：
+
+```text
+TA 分支本身在当前数据输入、增强、ResNet18 backbone 和 projector 配置下，
+按照 LeJEPA 目标从头训练，最多能学到多强的可分类表示？
+```
+
+因此需要一个更独立的诊断实验：把 TA 分支单独拆出来，从随机初始化开始训练，只判断 TA-LeJEPA 本身是否能训好。
+
+### 实验定义
+
+实验名称可以定义为：
+
+```text
+Standalone TA-LeJEPA Task0 pretrain
+```
+
+核心设定如下：
+
+```text
+数据：imagenet100_lejepa 的 Task0 数据
+输入：沿用当前 8-view 数据输入和增强
+模型：只使用 TA encoder，也就是 ResNet18
+projector：沿用当前 TagFex-LeJEPA 的 projector 配置，即 512 -> 2048 -> 2048 -> 1024 的三层 MLP
+loss：只使用 LeJEPA 自监督目标
+probe：使用 ta_feature.detach() 后接 LayerNorm + Linear
+```
+
+当前 TagFex-LeJEPA projector 的具体结构是：
+
+```text
+ta_feature_dim = 512
+proj_hidden_dim = 2048
+proj_output_dim = 1024
+
+TagFex_SimpleLinear(512, 2048)
+BatchNorm1d(2048)
+ReLU
+TagFex_SimpleLinear(2048, 2048)
+BatchNorm1d(2048)
+ReLU
+TagFex_SimpleLinear(2048, 1024)
+BatchNorm1d(1024)
+```
+
+其中 `TagFex_SimpleLinear` 本质上是一个 `nn.Linear`，并使用 Kaiming uniform 初始化权重、常数初始化 bias。
+
+对应的 LeJEPA 官方参考设定可以写成：
+
+```text
+数据：官方 minimal 示例使用 Imagenette；benchmark 中通常按对应数据集重新构建自监督训练集
+输入：多视图增强；minimal 示例使用 8 个 views，包含 RandomResizedCrop、ColorJitter、RandomGrayscale、GaussianBlur 等增强
+模型：minimal 示例使用 ViT-Small；Lightly benchmark 表中也给出了 ResNet18 对比结果
+projector：MLP projector，minimal 示例为 512 -> 2048 -> 2048 -> proj_dim，并使用 BatchNorm1d
+loss：同样只使用 LeJEPA 自监督目标，即 invariance loss + SIGReg loss
+probe：使用 encoder embedding.detach() 后接 LayerNorm + Linear
+```
+
+两者主要差异是：
+
+```text
+数据集：我们的实验是 imagenet100_lejepa Task0，官方 minimal 是 Imagenette 示例
+backbone：我们的 TA 是 ResNet18，官方 minimal 是 ViT-Small；官方 benchmark 里也有 ResNet18 结果
+输入增强：我们沿用当前 8-view 数据管线，官方使用自己的多视图增强配置
+projector：我们沿用 TagFex-LeJEPA projector，官方 minimal 是带 BatchNorm1d 的 MLP projector
+评估指标：我们先看 online linear probe，官方 benchmark 图里常见的是 kNN top1 或正式 linear eval
+```
+
+LeJEPA loss 保持当前形式：
+
+```text
+LeJEPA_total_loss = SIGReg_loss * lambda + invariance_loss * (1 - lambda)
+```
+
+这个实验不使用：
+
+```text
+TS 分支
+mean fusion
+主分类器 CE loss
+transfer loss
+KD loss
+memory replay
+CIL task update
+```
+
+也就是说，它不再判断完整 TagFex 的类增量性能，而是只回答 TA 自监督分支本身能不能训练出足够线性可分的表示。
+
+### 第一版配置
+
+为了尽量和 LeJEPA 官方的 ResNet 场景对齐，第一版可以使用：
+
+```text
+epochs: 200
+lr: 5e-4
+weight_decay: 5e-4
+lejepa_lambda: 0.05
+probe_lr: 1e-3
+probe_weight_decay: 1e-7
+probe_feature: ta_feature
+num_views: 8
+batch_size: 64 或显存允许的更大 batch size
+```
+
+其中：
+
+1. `lr=5e-4` 与 LeJEPA 官方推荐 starting point 一致。
+2. `weight_decay=5e-4` 对 ResNet 合理，官方说明 ViT 常用 `5e-2`，ResNet 常用 `5e-4`。
+3. `probe_lr=1e-3`、`probe_weight_decay=1e-7` 与官方 minimal 示例中的 online probe 设置一致。
+4. `lejepa_lambda=0.05` 是官方常见 sweep 范围 `0.01/0.02/0.05/0.1` 中的合理默认值。
+
+### 需要记录的指标
+
+逐 step 记录：
+
+```text
+standalone_ta/Prediction_Invariance_loss
+standalone_ta/SIGReg_loss
+standalone_ta/LeJEPA_total_loss
+standalone_ta/probe_loss
+standalone_ta/probe_top1
+standalone_ta/lr
+```
+
+每个 epoch 记录一次 batch 平均：
+
+```text
+standalone_ta_epoch/probe_top1
+standalone_ta_epoch/probe_loss
+standalone_ta_epoch/LeJEPA_total_loss
+```
+
+其中 `standalone_ta_epoch/probe_top1` 仍然是 epoch 内 batch probe top1 的平均值，不是正式 frozen linear eval，也不是 kNN top1。它主要用于观察训练趋势。
+
+如果后续要和 LeJEPA 官方 benchmark 中的 90% 左右结果比较，还需要额外增加 epoch-end kNN 或 frozen linear evaluation。否则 online probe 只能作为诊断指标，不能直接等价于官方 kNN top1。
+
+### 结果解释
+
+如果 standalone TA-LeJEPA 的 probe top1 明显超过当前 74% 到 75% 区间，甚至能接近 85% 到 90%，说明：
+
+```text
+LeJEPA 自监督分支本身在当前数据和 TA 架构下是可以训好的。
+之前性能不理想更可能来自接回 TagFex 后的联合训练方式、
+分类损失干扰、fusion/transfer 结构或训练调度。
+```
+
+如果 standalone TA-LeJEPA 也长期卡在 70% 到 80%，说明：
+
+```text
+主要瓶颈更可能在 TA-LeJEPA 自身设置，
+例如 ResNet18 backbone、augmentation、lambda、projector、学习率或训练 epoch 数。
+```
+
+因此，这个实验可以把问题拆清楚：
+
+```text
+是 LeJEPA + 当前 TA 设置本身学不好，
+还是 LeJEPA 接入完整 TagFex 后被其他模块和损失项影响了。
+```
+
+### 推荐结论表述
+
+> 为了判断 LeJEPA 自监督分支本身是否能训练好，需要把 TA 分支从完整 TagFex 中拆出来，做一个 Standalone TA-LeJEPA Task0 pretrain。该实验只保留 TA encoder、projector、LeJEPA invariance loss、SIGReg loss 和 online linear probe，不使用 TS、fusion、分类 CE、transfer、KD、memory 或 CIL task update。这样可以直接验证在当前 imagenet100_lejepa 数据输入、8-view 增强、ResNet18 TA 和 projector 配置下，LeJEPA 自监督目标本身能否学到足够线性可分的表示。如果 standalone 结果明显高于当前 74% 到 75% 的在线 probe 水平，则说明 LeJEPA 分支本身可训练，问题更可能在 TagFex 联合训练接入方式；如果 standalone 仍然卡在 70% 到 80%，则说明需要优先调整 TA-LeJEPA 自身配置。
+
