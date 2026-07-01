@@ -290,3 +290,45 @@ class iImageNet100_LeJEPA(iImageNet100):
     train_trsf = [MultiViewTransform(size_global=224, size_local=98, train=True)]
     test_trsf = [MultiViewTransform(size_global=224, size_local=98, train=False)]
     common_trsf = []
+
+
+class MultiViewTransformSplit:
+    def __init__(self, size_global=224, size_local=98, train=True):
+        self.train = train
+        self.common_ops = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
+            transforms.RandomApply([transforms.RandomSolarize(threshold=128)], p=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ]
+        self.global_transform = transforms.Compose([
+            transforms.RandomResizedCrop(size_global, scale=(0.3, 1.0)),
+            *self.common_ops,
+        ])
+        self.local_transform = transforms.Compose([
+            transforms.RandomResizedCrop(size_local, scale=(0.05, 0.3)),
+            *self.common_ops,
+        ])
+        self.test_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(size_global),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
+
+    def __call__(self, img):
+        if not self.train:
+            return self.test_transform(img)
+        global_views = torch.stack([self.global_transform(img) for _ in range(2)])
+        local_views = torch.stack([self.local_transform(img) for _ in range(6)])
+        return {"global": global_views, "local": local_views}
+
+
+class iImageNet100_LeJEPA_Split(iImageNet100):
+    use_path = True
+    train_trsf = [MultiViewTransformSplit(size_global=224, size_local=98, train=True)]
+    test_trsf = [MultiViewTransformSplit(size_global=224, size_local=98, train=False)]
+    common_trsf = []

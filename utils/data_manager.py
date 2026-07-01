@@ -4,7 +4,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR10_AA, iCIFAR100_AA, iImageNet100_AA, \
-    iImageNet100_LeJEPA, iCIFAR100_LeJEPA
+    iImageNet100_LeJEPA, iImageNet100_LeJEPA_Split, iCIFAR100_LeJEPA
 from tqdm import tqdm
 from utils.si_blurry_sampler import SiBlurrySampler
 import torch
@@ -486,6 +486,8 @@ def _get_idata(dataset_name):
         return iImageNet100_AA()
     elif name == "imagenet100_lejepa":  # 添加这一行
         return iImageNet100_LeJEPA()
+    elif name == "imagenet100_lejepa_split":
+        return iImageNet100_LeJEPA_Split()
     else:
         raise NotImplementedError("Unknown dataset {}.".format(dataset_name))
 

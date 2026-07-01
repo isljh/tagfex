@@ -14,6 +14,7 @@ TA 分支本身按 LeJEPA 目标训练，到底能不能学到可分类表示？
 
 - 现有 `DataManager` 中的 `imagenet100_lejepa` Task0 数据
 - 当前 8-view 训练输入和增强流程
+- 可选的 split-view 输入：2 个 224 global views + 6 个 98 local views
 - 一个独立的 ResNet18 TA encoder
 - 当前 TagFex-LeJEPA 的 projector 结构：`512 -> 2048 -> 2048 -> 1024`
 - LeJEPA invariance loss + SIGReg loss
@@ -35,15 +36,30 @@ CIL task update
 
 ## 运行命令
 
+原始 stacked-view 版本会把 6 个 local views resize 回 224，最终以 `[B, 8, 3, 224, 224]` 进入网络：
+
 ```bash
 python standalone/ta_lejepa_probe/train.py \
   --run-config exps/lejepa_sigreg/ta_lejepa_probe_task0.json
 ```
 
-默认配置文件是：
+split-view 版本更接近 LeJEPA 论文/README 的 multi-crop 输入：2 个 global views 保持 224，6 个 local views 保持 98，训练时分组 forward，再在 embedding 空间拼回 8 个 view 计算 LeJEPA loss：
+
+```bash
+python standalone/ta_lejepa_probe/train.py \
+  --run-config exps/lejepa_sigreg/ta_lejepa_probe_task0_split_views.json
+```
+
+默认 stacked-view 配置文件是：
 
 ```text
 exps/lejepa_sigreg/ta_lejepa_probe_task0.json
+```
+
+split-view 配置文件是：
+
+```text
+exps/lejepa_sigreg/ta_lejepa_probe_task0_split_views.json
 ```
 
 第一版默认配置：
@@ -57,12 +73,32 @@ eval_train: false
 lr: 5e-4
 weight_decay: 5e-4
 lejepa_lambda: 0.05
+sigreg_view_mode: view_wise
 probe_lr: 1e-3
 probe_weight_decay: 1e-7
 probe_norm: layernorm
+probe_view_mode: global
 num_views: 8
 ```
 
+split-view 版本额外使用：
+
+```text
+dataset: imagenet100_lejepa_split
+num_global_views: 2
+num_local_views: 6
+sigreg_view_mode: view_wise
+probe_view_mode: global
+```
+
+`probe_view_mode` 用来显式控制 online linear probe 的统计口径：
+
+```text
+global：只使用前 2 个 global views 的 ta_feature.detach()
+all：使用全部 8 个 views 的 ta_feature.detach()
+```
+
+LeJEPA self-supervised loss 不受 `probe_view_mode` 影响，始终使用 8 个 view。为了让 stacked-view 和 split-view 的 probe_top1 可以公平比较，两个配置默认都使用 `probe_view_mode: global`。这样 stacked-view 会从 `[B, 8, 3, 224, 224]` 中只取前 2 个 global views 做 probe，split-view 会直接使用 `global` 分组做 probe。
 
 ## 继续训练
 
@@ -152,6 +188,15 @@ standalone_ta/LeJEPA_total_loss
 standalone_ta/probe_loss
 standalone_ta/probe_top1
 standalone_ta/lr
+```
+
+step 级 CSV 会额外记录：
+
+```text
+input_mode          # stacked 或 split
+num_views           # LeJEPA loss 使用的 view 数
+num_probe_views     # online probe 使用的 view 数
+probe_view_mode     # global 或 all
 ```
 
 每个 epoch 记录一次训练过程中的 batch 平均值：

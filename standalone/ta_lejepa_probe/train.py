@@ -130,12 +130,17 @@ def make_probe(feature_dim, num_classes, norm):
 def prepare_args(cli_args):
     args = load_json(cli_args.base_config)
     args["device"] = [parse_device(cli_args.device)] if cli_args.device is not None else args.get("device", [0])
+    if cli_args.dataset is not None:
+        args["dataset"] = cli_args.dataset
     args["is_distributed"] = False
     args["local_rank"] = 1
     args["run_mode"] = "standalone_ta_lejepa_probe"
     args["num_views"] = cli_args.num_views
+    args["num_global_views"] = cli_args.num_global_views
+    args["num_local_views"] = cli_args.num_local_views
     args["lejepa_lambda"] = cli_args.lejepa_lambda
     args["probe_norm"] = cli_args.probe_norm
+    args["probe_view_mode"] = cli_args.probe_view_mode
     seed = args.get("seed", 0)
     if isinstance(seed, list):
         seed = seed[0]
@@ -254,6 +259,69 @@ def compute_selfsup_losses(sigreg, embedding, num_items, num_views, lamb, sigreg
     return inv_loss, sigreg_loss, lejepa_loss
 
 
+def select_probe_views(features, targets, num_items, num_views, num_global_views, probe_view_mode):
+    if probe_view_mode == "all":
+        return features, targets.repeat_interleave(num_views), num_views
+    if probe_view_mode == "global":
+        selected_views = min(num_global_views, num_views)
+        feature_views = features.reshape(num_items, num_views, -1)[:, :selected_views, :]
+        return feature_views.reshape(num_items * selected_views, -1), targets.repeat_interleave(selected_views), selected_views
+    raise ValueError("Unknown probe_view_mode: {}".format(probe_view_mode))
+
+
+def forward_training_batch(model, view_batch, targets, device, default_num_views, num_global_views, probe_view_mode):
+    if isinstance(view_batch, dict):
+        global_views = view_batch["global"].to(device, non_blocking=True)
+        local_views = view_batch["local"].to(device, non_blocking=True)
+        num_items = global_views.shape[0]
+        inferred_global_views = global_views.shape[1]
+        num_local_views = local_views.shape[1]
+
+        global_out = model(global_views.flatten(0, 1))
+        local_out = model(local_views.flatten(0, 1))
+
+        global_embedding = global_out["embedding"].reshape(num_items, inferred_global_views, -1)
+        local_embedding = local_out["embedding"].reshape(num_items, num_local_views, -1)
+        embedding = torch.cat([global_embedding, local_embedding], dim=1).reshape(
+            num_items * (inferred_global_views + num_local_views), -1
+        )
+
+        global_features = global_out["ta_feature"].reshape(num_items, inferred_global_views, -1)
+        local_features = local_out["ta_feature"].reshape(num_items, num_local_views, -1)
+        all_features = torch.cat([global_features, local_features], dim=1).reshape(
+            num_items * (inferred_global_views + num_local_views), -1
+        )
+        num_views = inferred_global_views + num_local_views
+        probe_features, probe_targets, num_probe_views = select_probe_views(
+            all_features, targets, num_items, num_views, inferred_global_views, probe_view_mode
+        )
+        return {
+            "embedding": embedding,
+            "probe_features": probe_features,
+            "probe_targets": probe_targets,
+            "num_items": num_items,
+            "num_views": num_views,
+            "num_probe_views": num_probe_views,
+            "input_mode": "split",
+        }
+
+    vs = view_batch.to(device, non_blocking=True)
+    inputs, _, num_items, num_views = flatten_views(vs, targets, default_num_views)
+    out = model(inputs.to(device, non_blocking=True))
+    probe_features, probe_targets, num_probe_views = select_probe_views(
+        out["ta_feature"], targets, num_items, num_views, num_global_views, probe_view_mode
+    )
+    return {
+        "embedding": out["embedding"],
+        "probe_features": probe_features,
+        "probe_targets": probe_targets,
+        "num_items": num_items,
+        "num_views": num_views,
+        "num_probe_views": num_probe_views,
+        "input_mode": "stacked",
+    }
+
+
 def update_probe(probe, optimizer, features, targets):
     probe_features = features.detach().float()
     if probe_features.size(0) != targets.size(0):
@@ -355,9 +423,15 @@ def save_checkpoint(
                 "eval_every": cli_args.eval_every,
                 "eval_train": cli_args.eval_train,
                 "num_workers": cli_args.num_workers,
+                "dataset": args.get("dataset"),
+                "num_views": cli_args.num_views,
+                "num_global_views": cli_args.num_global_views,
+                "num_local_views": cli_args.num_local_views,
                 "lejepa_lambda": cli_args.lejepa_lambda,
                 "sigreg_view_mode": cli_args.sigreg_view_mode,
                 "probe_norm": cli_args.probe_norm,
+                "probe_view_mode": cli_args.probe_view_mode,
+                "input_dataset": args.get("dataset"),
                 "probe_lr": cli_args.probe_lr,
                 "probe_weight_decay": cli_args.probe_weight_decay,
                 "num_rows": len(rows),
@@ -480,9 +554,13 @@ def run(cli_args):
                 "eval_every": cli_args.eval_every,
                 "eval_train": cli_args.eval_train,
                 "num_views": cli_args.num_views,
+                "num_global_views": cli_args.num_global_views,
+                "num_local_views": cli_args.num_local_views,
                 "lejepa_lambda": cli_args.lejepa_lambda,
                 "sigreg_view_mode": cli_args.sigreg_view_mode,
                 "probe_norm": cli_args.probe_norm,
+                "probe_view_mode": cli_args.probe_view_mode,
+                "input_dataset": args.get("dataset"),
             }),
             suffix="timestamp",
         )
@@ -495,14 +573,25 @@ def run(cli_args):
         model.train()
         probe.train()
         for batch_idx, batch in enumerate(loader):
-            vs = batch[1].to(device, non_blocking=True)
+            view_batch = batch[1]
             targets = batch[-1].to(device, non_blocking=True)
-            inputs, probe_targets, num_items, num_views = flatten_views(vs, targets, cli_args.num_views)
-            inputs = inputs.to(device, non_blocking=True)
+            batch_out = forward_training_batch(
+                model,
+                view_batch,
+                targets,
+                device,
+                cli_args.num_views,
+                cli_args.num_global_views,
+                cli_args.probe_view_mode,
+            )
+            embedding = batch_out["embedding"]
+            probe_features = batch_out["probe_features"]
+            probe_targets = batch_out["probe_targets"]
+            num_items = batch_out["num_items"]
+            num_views = batch_out["num_views"]
+            num_probe_views = batch_out["num_probe_views"]
+            input_mode = batch_out["input_mode"]
 
-            out = model(inputs)
-            ta_feature = out["ta_feature"]
-            embedding = out["embedding"]
             inv_loss, sigreg_loss, lejepa_loss = compute_selfsup_losses(
                 sigreg, embedding, num_items, num_views, cli_args.lejepa_lambda, cli_args.sigreg_view_mode
             )
@@ -512,7 +601,7 @@ def run(cli_args):
             optimizer.step()
             scheduler.step()
 
-            probe_loss, probe_top1 = update_probe(probe, probe_optimizer, ta_feature, probe_targets)
+            probe_loss, probe_top1 = update_probe(probe, probe_optimizer, probe_features, probe_targets)
             row = {
                 "epoch": epoch,
                 "iter": batch_idx,
@@ -525,6 +614,9 @@ def run(cli_args):
                 "lr": optimizer.param_groups[0]["lr"],
                 "num_items": int(num_items),
                 "num_views": int(num_views),
+                "num_probe_views": int(num_probe_views),
+                "input_mode": input_mode,
+                "probe_view_mode": cli_args.probe_view_mode,
             }
             rows.append(row)
             if swan_enabled:
@@ -630,7 +722,7 @@ def run(cli_args):
     with metrics_csv.open("w", encoding="utf-8", newline="") as f:
         fieldnames = [
             "epoch", "iter", "global_step", "inv_loss", "sigreg_loss", "lejepa_loss",
-            "probe_loss", "probe_top1", "lr", "num_items", "num_views",
+            "probe_loss", "probe_top1", "lr", "num_items", "num_views", "num_probe_views", "input_mode", "probe_view_mode",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -686,6 +778,11 @@ def run(cli_args):
                 "best_state": best_state,
                 "num_classes": num_classes,
                 "feature_dim": model.ta_feature_dim,
+                "dataset": args.get("dataset"),
+                "num_views": cli_args.num_views,
+                "num_global_views": cli_args.num_global_views,
+                "num_local_views": cli_args.num_local_views,
+                "probe_view_mode": cli_args.probe_view_mode,
                 "final_row": rows[-1] if rows else None,
                 "final_epoch_row": epoch_rows[-1] if epoch_rows else None,
             }),
@@ -712,6 +809,7 @@ def parse_args():
     parser.add_argument("--base-config", default=defaults.get("base_config", DEFAULT_BASE_CONFIG))
     parser.add_argument("--output-dir", default=defaults.get("output_dir", "standalone/ta_lejepa_probe/results/ta_lejepa_probe_task0_lr5e-4_ep200"))
     parser.add_argument("--device", default=defaults.get("device", "0"))
+    parser.add_argument("--dataset", default=defaults.get("dataset"))
     parser.add_argument("--epochs", type=int, default=defaults.get("epochs", 200))
     parser.add_argument("--extra-epochs", type=int, default=defaults.get("extra_epochs"))
     parser.add_argument("--resume-checkpoint", default=defaults.get("resume_checkpoint"))
@@ -728,7 +826,10 @@ def parse_args():
     parser.add_argument("--probe-lr", type=float, default=defaults.get("probe_lr", 1e-3))
     parser.add_argument("--probe-weight-decay", type=float, default=defaults.get("probe_weight_decay", 1e-7))
     parser.add_argument("--probe-norm", choices=["layernorm", "batchnorm", "none"], default=defaults.get("probe_norm", "layernorm"))
+    parser.add_argument("--probe-view-mode", choices=["global", "all"], default=defaults.get("probe_view_mode", "global"))
     parser.add_argument("--num-views", type=int, default=defaults.get("num_views", 8))
+    parser.add_argument("--num-global-views", type=int, default=defaults.get("num_global_views", 2))
+    parser.add_argument("--num-local-views", type=int, default=defaults.get("num_local_views", 6))
     parser.add_argument("--no-swanlab", action="store_true", default=defaults.get("no_swanlab", False))
     parser.add_argument("--swanlab-project", default=defaults.get("swanlab_project", "PyCIL_TagFex"))
     parser.add_argument("--swanlab-name", default=defaults.get("swanlab_name", "ta_lejepa_probe_task0_lr5e-4_ep200"))
