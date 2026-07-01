@@ -1,0 +1,21 @@
+{
+    "base_config": "exps/lejepa_sigreg/tagfex_lejepa_mean_fusion_imagenet100_online_probe.json",
+    "output_dir": "standalone/ta_lejepa_probe/results/ta_lejepa_probe_task0_lr5e-4_ep200",
+    "device": "0",
+    "epochs": 200,
+    "batch_size": 64,
+    "num_workers": 16,
+    "lr": 0.0005,
+    "weight_decay": 0.0005,
+    "lejepa_lambda": 0.05,
+    "sigreg_view_mode": "mixed",
+    "probe_lr": 0.001,
+    "probe_weight_decay": 1e-07,
+    "probe_norm": "layernorm",
+    "num_views": 8,
+    "swanlab_project": "TagFex_TA_LeJEPA_Probe",
+    "swanlab_name": "task0_lr5e-4_lambda0.05_ep200",
+    "eval_batch_size": 256,
+    "eval_every": 10,
+    "eval_train": false
+}

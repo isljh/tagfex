@@ -849,3 +849,85 @@ LeJEPA 自监督分支本身在当前数据和 TA 架构下是可以训好的。
 
 > 为了判断 LeJEPA 自监督分支本身是否能训练好，需要把 TA 分支从完整 TagFex 中拆出来，做一个 Standalone TA-LeJEPA Task0 pretrain。该实验只保留 TA encoder、projector、LeJEPA invariance loss、SIGReg loss 和 online linear probe，不使用 TS、fusion、分类 CE、transfer、KD、memory 或 CIL task update。这样可以直接验证在当前 imagenet100_lejepa 数据输入、8-view 增强、ResNet18 TA 和 projector 配置下，LeJEPA 自监督目标本身能否学到足够线性可分的表示。如果 standalone 结果明显高于当前 74% 到 75% 的在线 probe 水平，则说明 LeJEPA 分支本身可训练，问题更可能在 TagFex 联合训练接入方式；如果 standalone 仍然卡在 70% 到 80%，则说明需要优先调整 TA-LeJEPA 自身配置。
 
+## Best checkpoint 保存策略的讨论
+
+### 问题背景
+
+更标准的 best checkpoint 通常不是根据训练过程中的 batch accuracy 来选，而是在每个 epoch 结束后，用当前权重完整跑一遍 validation/test set，再根据 eval accuracy 选择表现最好的 checkpoint。
+
+例如：
+
+```text
+每个 epoch 结束
+-> model.eval()
+-> 跑完整 test_loader 或 validation_loader
+-> 得到 CNN top1 / probe top1
+-> 如果当前指标超过历史最好，就保存 best checkpoint
+```
+
+这样保存出来的 best 权重更接近“泛化表现最好”的模型，而不是“训练 batch 上看起来最好”的模型。
+
+### 和当前实验的关系
+
+对于 standalone TA-LeJEPA probe，这种做法比较可接受。因为模型只包含 TA encoder、projector 和 linear probe，结构较小，而且当前实验本身就是为了诊断 TA-LeJEPA 表示，所以每个 epoch 做一次 epoch-end probe eval 是合理的。
+
+但是对于完整 TagFex 或 TagFex-LeJEPA 主实验，情况不一样。完整模型本来训练就很慢，如果每个 epoch 结束后都额外跑完整 test set，会显著增加总时间。尤其是每个 task 都有较多 epoch 时，额外 eval 的成本会累积得很明显。
+
+因此，完整 TagFex 主实验暂时不急着加入每 epoch best checkpoint 保存。当前更稳妥的做法是：
+
+```text
+先保持每个 task 结束后保存 last checkpoint；
+是否增加 best checkpoint，等下一轮正式实验前再决定。
+```
+
+### 可选方案
+
+如果后续确实要给完整 TagFex 加 best checkpoint，可以考虑几种折中方案：
+
+1. **每个 epoch eval 一次**
+
+```text
+best = 当前 task 内 epoch-end CNN top1 最高的 checkpoint
+```
+
+这是最标准的 task 内 best 保存方式，但训练最慢。
+
+2. **每隔 k 个 epoch eval 一次**
+
+例如：
+
+```text
+best_eval_every = 5 或 10
+```
+
+这样可以减少 eval 开销，但可能错过中间某个真正最好的 epoch。
+
+3. **只在 Task0 或关键 task 上保存 best**
+
+如果主要关心 TA-LeJEPA 分支是否训好，可以只在 Task0 保存 best，后续 task 仍然只保存 last。
+
+4. **只在 debug/ablation 配置中开启**
+
+默认不启用 best checkpoint，只有在配置中显式打开：
+
+```json
+"save_best_checkpoint": true,
+"best_checkpoint_metric": "cnn_top1",
+"best_eval_every": 5
+```
+
+这样不会影响常规长实验。
+
+### 当前结论
+
+当前阶段先不修改完整 TagFex / TagFex-LeJEPA 主训练流程。原因是：
+
+```text
+完整实验本身已经较慢；
+每个 epoch 额外跑 test set 会进一步增加训练成本；
+best checkpoint 可能带来更规范的模型选择，但不一定显著提高最终结论；
+当前优先目标仍然是诊断 TA-LeJEPA 自监督分支本身是否能训好。
+```
+
+因此，best checkpoint 机制先保留为后续可选改动。下一轮如果要重新跑正式 TagFex / TagFex-LeJEPA 实验，再根据时间预算决定是否开启。
+

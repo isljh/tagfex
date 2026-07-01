@@ -221,12 +221,13 @@ def make_scheduler(optimizer, loader_len, epochs, lr):
     return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
 
 
-def save_extra_checkpoint(model, args, checkpoint, output_dir, rows, cli_args):
+def save_extra_checkpoint(model, args, checkpoint, output_dir, rows, cli_args, checkpoint_role="last", best_state=None, filename_suffix=None):
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     lr_tag = "{:.0e}".format(cli_args.lr).replace("e-0", "e-").replace("e+0", "e")
-    save_path = ckpt_dir / "{}_{}_task_0_selfsup_continue_lr{}_ep{}.pth".format(
-        args["prefix"], args["seed"], lr_tag, cli_args.epochs
+    suffix = filename_suffix or "lr{}_ep{}".format(lr_tag, cli_args.epochs)
+    save_path = ckpt_dir / "{}_{}_task_0_selfsup_continue_{}.pth".format(
+        args["prefix"], args["seed"], suffix
     )
     ptr = get_ptr(model)
     extra_state = {
@@ -242,6 +243,8 @@ def save_extra_checkpoint(model, args, checkpoint, output_dir, rows, cli_args):
         "online_probe_state": model.get_online_probe_state() if hasattr(model, "get_online_probe_state") else None,
         "sigreg_state": model.get_sigreg_state() if hasattr(model, "get_sigreg_state") else None,
         "task0_selfsup_continue_state": {
+            "checkpoint_role": checkpoint_role,
+            "best_state": best_state,
             "epochs": cli_args.epochs,
             "lr": cli_args.lr,
             "weight_decay": cli_args.weight_decay,
@@ -306,6 +309,13 @@ def run(cli_args):
 
     rows = []
     epoch_rows = []
+    best_state = {
+        "metric": "epoch_mean_probe_top1",
+        "mode": "max",
+        "best_value": None,
+        "best_epoch": None,
+        "checkpoint": None,
+    }
     global_step = 0
     lamb = args.get("lejepa_lambda", 0.05)
     default_num_views = int(args.get("num_views", 8))
@@ -381,6 +391,28 @@ def run(cli_args):
             "probe_feature": probe_feature_name,
         }
         epoch_rows.append(epoch_row)
+        current_best_value = epoch_row.get("probe_top1")
+        if current_best_value is not None and (
+            best_state["best_value"] is None or current_best_value > best_state["best_value"]
+        ):
+            lr_tag = "{:.0e}".format(cli_args.lr).replace("e-0", "e-").replace("e+0", "e")
+            best_state.update({
+                "best_value": current_best_value,
+                "best_epoch": epoch,
+                "best_epoch_row": dict(epoch_row),
+            })
+            best_path = save_extra_checkpoint(
+                model,
+                args,
+                checkpoint,
+                output_dir,
+                rows,
+                cli_args,
+                checkpoint_role="best_epoch_mean_probe",
+                best_state=dict(best_state),
+                filename_suffix="best_probe_lr{}_ep{}".format(lr_tag, cli_args.epochs),
+            )
+            best_state["checkpoint"] = str(best_path)
         if swan_enabled:
             payload = {
                 "task0_extra_epoch/Prediction_Invariance_loss": epoch_row["inv_loss"],
@@ -416,7 +448,16 @@ def run(cli_args):
         writer.writeheader()
         writer.writerows(epoch_rows)
 
-    save_path = save_extra_checkpoint(model, args, checkpoint, output_dir, rows, cli_args)
+    save_path = save_extra_checkpoint(
+        model,
+        args,
+        checkpoint,
+        output_dir,
+        rows,
+        cli_args,
+        checkpoint_role="last",
+        best_state=dict(best_state),
+    )
     summary_path = output_dir / "task0_selfsup_continue_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(json_ready({
@@ -425,7 +466,9 @@ def run(cli_args):
             "output_dir": str(output_dir),
             "metrics_csv": str(csv_path),
             "epoch_metrics_csv": str(epoch_csv_path),
-            "extra_checkpoint": str(save_path),
+            "last_checkpoint": str(save_path),
+            "best_checkpoint": best_state.get("checkpoint"),
+            "best_state": best_state,
             "loaded_probe_from_checkpoint": loaded_probe,
             "source_checkpoint_has_online_probe_state": checkpoint.get("online_probe_state") is not None,
             "probe_feature": cli_args.probe_feature,
@@ -437,7 +480,9 @@ def run(cli_args):
         swanlab.finish()
     print("Saved metrics to {}".format(csv_path))
     print("Saved epoch metrics to {}".format(epoch_csv_path))
-    print("Saved continuation checkpoint to {}".format(save_path))
+    print("Saved last continuation checkpoint to {}".format(save_path))
+    if best_state.get("checkpoint"):
+        print("Saved best continuation checkpoint to {}".format(best_state["checkpoint"]))
 
 
 def parse_args():
