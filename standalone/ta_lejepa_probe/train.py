@@ -80,9 +80,20 @@ def restore_rng_state(state):
         return
     random.setstate(state["python_random_state"])
     np.random.set_state(state["numpy_random_state"])
-    torch.set_rng_state(state["torch_rng_state"])
-    if state.get("torch_cuda_rng_state_all") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda_rng_state_all"])
+
+    torch_rng_state = state.get("torch_rng_state")
+    if torch_rng_state is not None:
+        if not isinstance(torch_rng_state, torch.Tensor):
+            torch_rng_state = torch.as_tensor(torch_rng_state, dtype=torch.uint8)
+        torch.set_rng_state(torch_rng_state.detach().cpu().to(torch.uint8))
+
+    cuda_rng_states = state.get("torch_cuda_rng_state_all")
+    if cuda_rng_states is not None and torch.cuda.is_available():
+        cuda_rng_states = [
+            rng.detach().cpu().to(torch.uint8) if isinstance(rng, torch.Tensor) else torch.as_tensor(rng, dtype=torch.uint8)
+            for rng in cuda_rng_states
+        ]
+        torch.cuda.set_rng_state_all(cuda_rng_states)
 
 
 class StandaloneTALEJEPA(nn.Module):
@@ -454,8 +465,10 @@ def load_resume_checkpoint(path, model, probe, optimizer, probe_optimizer, devic
     if reset_lr:
         for group in optimizer.param_groups:
             group["lr"] = lr
+            group["initial_lr"] = lr
         for group in probe_optimizer.param_groups:
             group["lr"] = probe_lr
+            group["initial_lr"] = probe_lr
     restore_rng_state(ckpt.get("rng_state"))
     state = ckpt.get("standalone_ta_lejepa_state", {})
     current_epoch = state.get("current_epoch")
